@@ -120,7 +120,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         liveTranslateTask = Task { @MainActor in
             while isLiveTranslating && !Task.isCancelled {
                 await refreshTranslation()
-                try? await Task.sleep(nanoseconds: 800_000_000) // refresh every 0.8s for better tracking
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
     }
@@ -165,6 +165,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func refreshTranslation() async {
         guard isLiveTranslating else { return }
+        
+        // Hide overlay so screencapture does not include translated text
+        overlayWindow?.orderOut(nil)
+        // Small delay so the hide takes effect before capture
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        
         do {
             let imageURL = try captureFullScreen()
             let items = try await performOCR(on: imageURL)
@@ -178,9 +184,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 blocks.append(TranslatedBlock(text: translated, boundingBox: item.boundingBox))
             }
             
-            updateOverlay(blocks: blocks)
+            // Show overlay again with fresh translations
+            if isLiveTranslating {
+                overlayWindow?.makeKeyAndOrderFront(nil)
+                updateOverlay(blocks: blocks)
+            }
         } catch {
             print("Live refresh error: \(error)")
+            if isLiveTranslating {
+                overlayWindow?.makeKeyAndOrderFront(nil)
+            }
         }
     }
     
@@ -415,7 +428,6 @@ class TranslationOverlayView: NSView {
         
         for block in blocks {
             let rect = convertToView(block.boundingBox)
-            // Opaque cover to blur/hide original text
             let coverRect = rect.insetBy(dx: -4, dy: -2)
             NSColor.black.withAlphaComponent(0.92).setFill()
             coverRect.fill()
