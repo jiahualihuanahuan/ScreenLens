@@ -53,14 +53,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupMenu()
         setupHotKeys()
-        print("ScreenLens running. Hotkeys: ⌥⌘T translate, ⌥⌘S word-select search")
+        print("ScreenLens running. Hotkeys: ⌥⌘T translate active area, ⌥⌘S word-select search")
         print("Translation stays until you move the mouse, click, or type.")
         print("App stays running until you quit from the menu or terminal.")
     }
     
     func setupMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Translate Screen (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Translate Active Area (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Word Select & Search (⌥⌘S)", action: #selector(selectAndSearch), keyEquivalent: ""))
         menu.addItem(.separator())
         
@@ -111,28 +111,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - Translate
+    // MARK: - Translate (active area only)
     
     func performTranslate() async {
         dismissTranslation()
         print("Translate triggered")
         
+        guard let region = locateActiveTextRegion() else {
+            showAlert("Could not find an active text area. Grant Accessibility permission and focus a window with text.")
+            return
+        }
+        
+        print("Translating active region: \(region)")
+        
         do {
-            // Prefer AXUIElement region if available, else full screen
-            let region = locateActiveTextRegion()
-            let imageURL: URL
-            if let region = region {
-                print("Using focused region: \(region)")
-                imageURL = try await captureRegion(region)
-            } else {
-                imageURL = try captureFullScreen()
-            }
-            
+            let imageURL = try await captureRegion(region)
             let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
             
             guard !items.isEmpty else {
-                showAlert("No text found.")
+                showAlert("No text found in the active area.")
                 return
             }
             
@@ -145,28 +143,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             
             guard !blocks.isEmpty else {
-                showAlert("Nothing to translate.")
+                showAlert("Nothing to translate in the active area.")
                 return
             }
             
             showTranslationOverlay(blocks: blocks, region: region)
             startInputMonitoring()
             await HistoryLogger.shared.record(blocks: blocks)
-            print("Translation shown. Stays until mouse move, click, or key.")
+            print("Translation shown for active area only.")
         } catch {
             print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
         }
     }
     
-    func showTranslationOverlay(blocks: [TranslatedBlock], region: CGRect?) {
+    func showTranslationOverlay(blocks: [TranslatedBlock], region: CGRect) {
         overlayWindow?.orderOut(nil)
         overlayWindow = nil
         
-        let frame = region ?? NSScreen.main?.frame ?? .zero
-        
         let window = FloatingPanel(
-            contentRect: frame,
+            contentRect: region,
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
@@ -178,7 +174,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         window.hasShadow = false
         window.isReleasedWhenClosed = false
-        window.setFrame(frame, display: true)
+        window.setFrame(region, display: true)
         
         let view = TranslationOverlayView()
         view.blocks = blocks
@@ -321,6 +317,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
         
+        // Prefer the focused UI element (text field, editor, web content)
         var targetElement: AnyObject?
         if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &targetElement) != .success {
             AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &targetElement)
@@ -340,10 +337,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         AXValueGetValue(posValue as! AXValue, .cgPoint, &point)
         AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
         
-        let raw = CGRect(origin: point, size: size)
-        if raw.width > 800 && raw.height > 600 {
-            return raw.insetBy(dx: raw.width * 0.08, dy: raw.height * 0.08)
+        var raw = CGRect(origin: point, size: size)
+        
+        // If the focused element is a whole large window, inset to the content area
+        if raw.width > 700 && raw.height > 500 {
+            raw = raw.insetBy(dx: raw.width * 0.12, dy: raw.height * 0.10)
         }
+        
+        // Reject tiny or invalid regions
+        guard raw.width > 80, raw.height > 40 else { return nil }
         return raw
     }
     
@@ -363,7 +365,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func captureRegion(_ rect: CGRect) async throws -> URL {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
-            return try captureFullScreen()
+            throw NSError(domain: "ScreenLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "No display found"])
         }
         
         let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -380,7 +382,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try data.write(to: url)
             return url
         }
-        return try captureFullScreen()
+        throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to write region capture"])
     }
     
     nonisolated func performOCR(on imageURL: URL) async throws -> [TextItem] {
