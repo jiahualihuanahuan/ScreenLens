@@ -136,7 +136,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             baselineSignature = signature
             showTranslationOverlay(blocks: blocks)
             startChangeMonitoring()
-            print("Translation shown. Monitoring for screen changes...")
+            print("Translation shown. Monitoring underlay for changes...")
         } catch {
             print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
@@ -177,7 +177,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         isTranslating = true
         monitorTask = Task { @MainActor in
             while isTranslating && !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
                 guard isTranslating else { break }
                 await checkForScreenChange()
             }
@@ -185,30 +185,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func checkForScreenChange() async {
-        // Hide overlay so capture is of the real content
-        overlayWindow?.orderOut(nil)
-        try? await Task.sleep(nanoseconds: 40_000_000)
+        // Capture content *under* the overlay so we never hide it
+        guard let window = overlayWindow else { return }
+        let windowID = CGWindowID(window.windowNumber)
         
         do {
-            let imageURL = try captureFullScreen()
-            let current = try imageSignature(from: imageURL)
-            try? FileManager.default.removeItem(at: imageURL)
-            
-            let changed = signatureChanged(baseline: baselineSignature, current: current)
+            let signature = try captureUnderlaySignature(excludingWindow: windowID)
+            let changed = signatureChanged(baseline: baselineSignature, current: signature)
             if changed {
                 print("Screen changed significantly — dismissing translation")
                 stopMonitoring()
-            } else {
-                // Restore overlay
-                if isTranslating {
-                    overlayWindow?.makeKeyAndOrderFront(nil)
-                }
             }
+            // No else: overlay stays visible the whole time
         } catch {
             print("Change check error: \(error)")
-            if isTranslating {
-                overlayWindow?.makeKeyAndOrderFront(nil)
-            }
         }
     }
     
@@ -325,14 +315,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return url
     }
     
-    /// Downscaled grayscale signature for change detection.
-    /// Small enough that video frames rarely trip the threshold, but scroll/page changes do.
+    /// Capture content under the overlay window (excludes our translation layer).
+    nonisolated func captureUnderlaySignature(excludingWindow windowID: CGWindowID) throws -> [UInt8] {
+        guard let screen = NSScreen.main else {
+            throw NSError(domain: "ScreenLens", code: 6, userInfo: [NSLocalizedDescriptionKey: "No main screen"])
+        }
+        let rect = screen.frame
+        
+        // Capture everything on screen below our overlay window
+        guard let image = CGWindowListCreateImage(
+            rect,
+            .optionOnScreenBelowWindow,
+            windowID,
+            [.bestResolution, .boundsIgnoreFraming]
+        ) else {
+            throw NSError(domain: "ScreenLens", code: 7, userInfo: [NSLocalizedDescriptionKey: "Underlay capture failed"])
+        }
+        
+        return try signatureFromCGImage(image)
+    }
+    
     nonisolated func imageSignature(from imageURL: URL) throws -> [UInt8] {
         guard let image = NSImage(contentsOf: imageURL),
               let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw NSError(domain: "ScreenLens", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to read image for signature"])
         }
-        
+        return try signatureFromCGImage(cg)
+    }
+    
+    nonisolated func signatureFromCGImage(_ cg: CGImage) throws -> [UInt8] {
         let width = 48
         let height = 27
         var pixels = [UInt8](repeating: 0, count: width * height)
@@ -354,8 +365,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return pixels
     }
     
-    /// Returns true if the screen changed enough to dismiss (scroll, navigation).
-    /// Threshold is high enough to ignore typical video playback noise.
     nonisolated func signatureChanged(baseline: [UInt8], current: [UInt8]) -> Bool {
         guard baseline.count == current.count, !baseline.isEmpty else { return false }
         var diffSum: Int = 0
@@ -363,7 +372,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             diffSum += abs(Int(baseline[i]) - Int(current[i]))
         }
         let avgDiff = Double(diffSum) / Double(baseline.count)
-        // ~12+ average pixel difference usually means a real layout change
         return avgDiff > 12.0
     }
     
