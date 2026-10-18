@@ -31,8 +31,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var overlayWindow: NSWindow?
     var selectionWindow: NSWindow?
     var targetLanguage: String = "zh"
-    var liveTranslateTask: Task<Void, Never>?
-    var isLiveTranslating = false
+    var monitorTask: Task<Void, Never>?
+    var isTranslating = false
+    var baselineSignature: [UInt8] = []
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -44,14 +45,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupMenu()
         setupHotKeys()
-        print("ScreenLens running. Hotkeys: ⌥⌘T live translate, ⌥⌘S word-select search")
-        print("Press ⌥⌘T again to stop live translation.")
+        print("ScreenLens running. Hotkeys: ⌥⌘T translate, ⌥⌘S word-select search")
+        print("Translation stays until the screen meaningfully changes.")
         print("App stays running until you quit from the menu or terminal.")
     }
     
     func setupMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Live Translate (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Translate Screen (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Word Select & Search (⌥⌘S)", action: #selector(selectAndSearch), keyEquivalent: ""))
         menu.addItem(.separator())
         
@@ -85,7 +86,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupHotKeys() {
         translateHotKey = HotKey(key: .t, modifiers: [.option, .command])
         translateHotKey?.keyDownHandler = { [weak self] in
-            Task { @MainActor in self?.toggleLiveTranslate() }
+            Task { @MainActor in self?.translateScreen() }
         }
         
         searchHotKey = HotKey(key: .s, modifiers: [.option, .command])
@@ -95,47 +96,56 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     @objc func translateScreen() {
-        toggleLiveTranslate()
+        Task { @MainActor in await performTranslate() }
     }
     
     @objc func selectAndSearch() {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - Live Translate
+    // MARK: - One-shot Translate with change monitoring
     
-    func toggleLiveTranslate() {
-        if isLiveTranslating {
-            stopLiveTranslate()
-        } else {
-            startLiveTranslate()
-        }
-    }
-    
-    func startLiveTranslate() {
-        print("Starting live translation")
-        isLiveTranslating = true
-        ensureOverlayWindow()
+    func performTranslate() async {
+        stopMonitoring()
+        print("Translate triggered")
         
-        liveTranslateTask = Task { @MainActor in
-            while isLiveTranslating && !Task.isCancelled {
-                await refreshTranslation()
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+        do {
+            let imageURL = try captureFullScreen()
+            let signature = try imageSignature(from: imageURL)
+            let items = try await performOCR(on: imageURL)
+            try? FileManager.default.removeItem(at: imageURL)
+            
+            guard !items.isEmpty else {
+                showAlert("No text found on screen.")
+                return
             }
+            
+            var blocks: [TranslatedBlock] = []
+            for item in items {
+                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
+                blocks.append(TranslatedBlock(text: translated, boundingBox: item.boundingBox))
+            }
+            
+            guard !blocks.isEmpty else {
+                showAlert("Nothing to translate.")
+                return
+            }
+            
+            baselineSignature = signature
+            showTranslationOverlay(blocks: blocks)
+            startChangeMonitoring()
+            print("Translation shown. Monitoring for screen changes...")
+        } catch {
+            print("Translate error: \(error)")
+            showAlert("Translate failed: \(error.localizedDescription)")
         }
     }
     
-    func stopLiveTranslate() {
-        print("Stopping live translation")
-        isLiveTranslating = false
-        liveTranslateTask?.cancel()
-        liveTranslateTask = nil
+    func showTranslationOverlay(blocks: [TranslatedBlock]) {
         overlayWindow?.orderOut(nil)
         overlayWindow = nil
-    }
-    
-    func ensureOverlayWindow() {
-        if overlayWindow != nil { return }
         
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
@@ -157,57 +167,64 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.setFrame(frame, display: true)
         
         let view = TranslationOverlayView()
+        view.blocks = blocks
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
         overlayWindow = window
-        print("Live overlay window created (click-through)")
     }
     
-    func refreshTranslation() async {
-        guard isLiveTranslating else { return }
-        
-        // Hide overlay so screencapture does not include translated text
+    func startChangeMonitoring() {
+        isTranslating = true
+        monitorTask = Task { @MainActor in
+            while isTranslating && !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                guard isTranslating else { break }
+                await checkForScreenChange()
+            }
+        }
+    }
+    
+    func checkForScreenChange() async {
+        // Hide overlay so capture is of the real content
         overlayWindow?.orderOut(nil)
-        // Small delay so the hide takes effect before capture
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        try? await Task.sleep(nanoseconds: 40_000_000)
         
         do {
             let imageURL = try captureFullScreen()
-            let items = try await performOCR(on: imageURL)
+            let current = try imageSignature(from: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
             
-            var blocks: [TranslatedBlock] = []
-            for item in items {
-                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-                let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
-                blocks.append(TranslatedBlock(text: translated, boundingBox: item.boundingBox))
-            }
-            
-            // Show overlay again with fresh translations
-            if isLiveTranslating {
-                overlayWindow?.makeKeyAndOrderFront(nil)
-                updateOverlay(blocks: blocks)
+            let changed = signatureChanged(baseline: baselineSignature, current: current)
+            if changed {
+                print("Screen changed significantly — dismissing translation")
+                stopMonitoring()
+            } else {
+                // Restore overlay
+                if isTranslating {
+                    overlayWindow?.makeKeyAndOrderFront(nil)
+                }
             }
         } catch {
-            print("Live refresh error: \(error)")
-            if isLiveTranslating {
+            print("Change check error: \(error)")
+            if isTranslating {
                 overlayWindow?.makeKeyAndOrderFront(nil)
             }
         }
     }
     
-    func updateOverlay(blocks: [TranslatedBlock]) {
-        guard let window = overlayWindow,
-              let view = window.contentView as? TranslationOverlayView else { return }
-        view.blocks = blocks
-        view.needsDisplay = true
+    func stopMonitoring() {
+        isTranslating = false
+        monitorTask?.cancel()
+        monitorTask = nil
+        overlayWindow?.orderOut(nil)
+        overlayWindow = nil
+        baselineSignature = []
     }
     
     // MARK: - Word Select Search
     
     func performWordSelectSearch() async {
-        if isLiveTranslating { stopLiveTranslate() }
+        stopMonitoring()
         
         print("Word select search triggered")
         do {
@@ -306,6 +323,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             throw NSError(domain: "ScreenLens", code: 1, userInfo: [NSLocalizedDescriptionKey: "Screen capture failed. Grant Screen Recording permission."])
         }
         return url
+    }
+    
+    /// Downscaled grayscale signature for change detection.
+    /// Small enough that video frames rarely trip the threshold, but scroll/page changes do.
+    nonisolated func imageSignature(from imageURL: URL) throws -> [UInt8] {
+        guard let image = NSImage(contentsOf: imageURL),
+              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw NSError(domain: "ScreenLens", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to read image for signature"])
+        }
+        
+        let width = 48
+        let height = 27
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let ctx = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            throw NSError(domain: "ScreenLens", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to create signature context"])
+        }
+        
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return pixels
+    }
+    
+    /// Returns true if the screen changed enough to dismiss (scroll, navigation).
+    /// Threshold is high enough to ignore typical video playback noise.
+    nonisolated func signatureChanged(baseline: [UInt8], current: [UInt8]) -> Bool {
+        guard baseline.count == current.count, !baseline.isEmpty else { return false }
+        var diffSum: Int = 0
+        for i in 0..<baseline.count {
+            diffSum += abs(Int(baseline[i]) - Int(current[i]))
+        }
+        let avgDiff = Double(diffSum) / Double(baseline.count)
+        // ~12+ average pixel difference usually means a real layout change
+        return avgDiff > 12.0
     }
     
     nonisolated func performOCR(on imageURL: URL) async throws -> [TextItem] {
