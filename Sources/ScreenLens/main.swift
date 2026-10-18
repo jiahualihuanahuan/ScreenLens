@@ -31,6 +31,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var overlayWindow: NSWindow?
     var selectionWindow: NSWindow?
     var targetLanguage: String = "zh"
+    var liveTranslateTask: Task<Void, Never>?
+    var isLiveTranslating = false
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -42,13 +44,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupMenu()
         setupHotKeys()
-        print("ScreenLens running. Hotkeys: ⌥⌘T in-place translate, ⌥⌘S word-select search")
+        print("ScreenLens running. Hotkeys: ⌥⌘T live translate, ⌥⌘S word-select search")
+        print("Press ⌥⌘T again or Escape to stop live translation.")
         print("App stays running until you quit from the menu or terminal.")
     }
     
     func setupMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Translate Screen In-Place (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Live Translate (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Word Select & Search (⌥⌘S)", action: #selector(selectAndSearch), keyEquivalent: ""))
         menu.addItem(.separator())
         
@@ -82,7 +85,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupHotKeys() {
         translateHotKey = HotKey(key: .t, modifiers: [.option, .command])
         translateHotKey?.keyDownHandler = { [weak self] in
-            Task { @MainActor in self?.translateScreen() }
+            Task { @MainActor in self?.toggleLiveTranslate() }
         }
         
         searchHotKey = HotKey(key: .s, modifiers: [.option, .command])
@@ -92,58 +95,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     @objc func translateScreen() {
-        Task { @MainActor in await performTranslate() }
+        toggleLiveTranslate()
     }
     
     @objc func selectAndSearch() {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - In-place Translate
+    // MARK: - Live Translate
     
-    func performTranslate() async {
-        print("In-place translate triggered")
-        do {
-            let imageURL = try captureFullScreen()
-            print("Captured screen")
-            let items = try await performOCR(on: imageURL)
-            try? FileManager.default.removeItem(at: imageURL)
-            print("OCR found \(items.count) text blocks")
-            
-            guard !items.isEmpty else {
-                showAlert("No text found on screen.")
-                return
-            }
-            
-            // No artificial limit — translate all blocks
-            var blocks: [TranslatedBlock] = []
-            for item in items {
-                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-                let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
-                blocks.append(TranslatedBlock(text: translated, boundingBox: item.boundingBox))
-            }
-            
-            guard !blocks.isEmpty else {
-                showAlert("Nothing to translate.")
-                return
-            }
-            
-            print("Showing translation overlay with \(blocks.count) blocks")
-            showTranslationOverlay(blocks: blocks)
-        } catch {
-            print("Translate error: \(error)")
-            showAlert("Translate failed: \(error.localizedDescription)")
+    func toggleLiveTranslate() {
+        if isLiveTranslating {
+            stopLiveTranslate()
+        } else {
+            startLiveTranslate()
         }
     }
     
-    func showTranslationOverlay(blocks: [TranslatedBlock]) {
+    func startLiveTranslate() {
+        print("Starting live translation")
+        isLiveTranslating = true
+        ensureOverlayWindow()
+        
+        liveTranslateTask = Task { @MainActor in
+            while isLiveTranslating && !Task.isCancelled {
+                await refreshTranslation()
+                try? await Task.sleep(nanoseconds: 1_500_000_000) // refresh every 1.5s
+            }
+        }
+    }
+    
+    func stopLiveTranslate() {
+        print("Stopping live translation")
+        isLiveTranslating = false
+        liveTranslateTask?.cancel()
+        liveTranslateTask = nil
         overlayWindow?.orderOut(nil)
         overlayWindow = nil
+    }
+    
+    func ensureOverlayWindow() {
+        if overlayWindow != nil { return }
         
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
-        print("Screen frame: \(frame)")
         
         let window = NSWindow(
             contentRect: frame,
@@ -155,47 +150,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.level = .statusBar
         window.backgroundColor = .clear
         window.isOpaque = false
-        window.ignoresMouseEvents = false
+        window.ignoresMouseEvents = true // click-through so you can scroll the page
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.hasShadow = false
         window.isReleasedWhenClosed = false
         window.setFrame(frame, display: true)
         
-        let view = TranslationOverlayView(blocks: blocks)
-        view.onDismiss = { [weak self, weak window] in
-            DispatchQueue.main.async {
-                window?.orderOut(nil)
-                if self?.overlayWindow === window {
-                    self?.overlayWindow = nil
-                }
-            }
-        }
-        
+        let view = TranslationOverlayView(blocks: [])
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         overlayWindow = window
-        print("Translation overlay shown, view bounds: \(view.bounds)")
-        
-        Task { @MainActor [weak window] in
-            try? await Task.sleep(nanoseconds: 12_000_000_000)
-            if overlayWindow === window {
-                window?.orderOut(nil)
-                overlayWindow = nil
+        print("Live overlay window created (click-through)")
+    }
+    
+    func refreshTranslation() async {
+        guard isLiveTranslating else { return }
+        do {
+            let imageURL = try captureFullScreen()
+            let items = try await performOCR(on: imageURL)
+            try? FileManager.default.removeItem(at: imageURL)
+            
+            var blocks: [TranslatedBlock] = []
+            for item in items {
+                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
+                blocks.append(TranslatedBlock(text: translated, boundingBox: item.boundingBox))
             }
+            
+            updateOverlay(blocks: blocks)
+        } catch {
+            print("Live refresh error: \(error)")
         }
+    }
+    
+    func updateOverlay(blocks: [TranslatedBlock]) {
+        guard let window = overlayWindow,
+              let view = window.contentView as? TranslationOverlayView else { return }
+        view.blocks = blocks
+        view.needsDisplay = true
     }
     
     // MARK: - Word Select Search
     
     func performWordSelectSearch() async {
+        // Stop live translate if running
+        if isLiveTranslating { stopLiveTranslate() }
+        
         print("Word select search triggered")
         do {
             let imageURL = try captureFullScreen()
-            print("Captured screen for word select")
             let words = try await extractWords(from: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
-            print("Found \(words.count) words")
             
             guard !words.isEmpty else {
                 showAlert("No words found on screen.")
@@ -257,7 +263,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         selectionWindow = window
-        print("Word selection overlay shown")
     }
     
     func openGoogleSearch(query: String) {
@@ -386,19 +391,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Translation Overlay View
 
 class TranslationOverlayView: NSView {
-    let blocks: [TranslatedBlock]
-    var onDismiss: (() -> Void)?
-    
-    init(blocks: [TranslatedBlock]) {
-        self.blocks = blocks
-        super.init(frame: .zero)
-    }
-    
-    required init?(coder: NSCoder) { fatalError() }
+    var blocks: [TranslatedBlock] = []
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.black.withAlphaComponent(0.12).setFill()
+        // Very light dim so original content is still visible for scrolling
+        NSColor.black.withAlphaComponent(0.05).setFill()
         bounds.fill()
         
         let paragraph = NSMutableParagraphStyle()
@@ -408,7 +406,7 @@ class TranslationOverlayView: NSView {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .medium),
             .foregroundColor: NSColor.white,
-            .backgroundColor: NSColor.black.withAlphaComponent(0.8),
+            .backgroundColor: NSColor.black.withAlphaComponent(0.75),
             .paragraphStyle: paragraph
         ]
         
@@ -421,26 +419,12 @@ class TranslationOverlayView: NSView {
     }
     
     private func convertToView(_ normalized: CGRect) -> CGRect {
-        // Vision normalized coords: origin bottom-left, 0–1
-        // NSView also origin bottom-left, so direct mapping
         let x = normalized.origin.x * bounds.width
         let y = normalized.origin.y * bounds.height
         let w = normalized.size.width * bounds.width
         let h = normalized.size.height * bounds.height
         return CGRect(x: x, y: y, width: max(w, 30), height: max(h, 16))
     }
-    
-    override func mouseDown(with event: NSEvent) {
-        onDismiss?()
-    }
-    
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
-            onDismiss?()
-        }
-    }
-    
-    override var acceptsFirstResponder: Bool { true }
 }
 
 // MARK: - Word Selection View
