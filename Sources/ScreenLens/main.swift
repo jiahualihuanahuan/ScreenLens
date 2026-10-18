@@ -156,7 +156,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
         window.setFrame(frame, display: true)
         
-        let view = TranslationOverlayView(blocks: [])
+        let view = TranslationOverlayView()
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
         overlayWindow = window
