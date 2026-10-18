@@ -4,8 +4,16 @@ import Vision
 import Translation
 import Foundation
 
+// MARK: - Models
+
+struct TextItem: Sendable {
+    let text: String
+    let boundingBox: CGRect
+}
+
 // MARK: - App Delegate
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var translateHotKey: HotKey?
@@ -51,7 +59,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func setLanguage(_ sender: NSMenuItem) {
         if let lang = sender.representedObject as? String {
             targetLanguage = lang
-            // refresh menu states
             if let submenu = sender.menu {
                 for item in submenu.items {
                     item.state = (item.representedObject as? String == lang) ? .on : .off
@@ -62,18 +69,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func setupHotKeys() {
         translateHotKey = HotKey(key: .t, modifiers: [.option, .command])
-        translateHotKey?.keyDownHandler = { [weak self] in self?.translateScreen() }
+        translateHotKey?.keyDownHandler = { [weak self] in
+            Task { @MainActor in
+                self?.translateScreen()
+            }
+        }
         
         searchHotKey = HotKey(key: .s, modifiers: [.option, .command])
-        searchHotKey?.keyDownHandler = { [weak self] in self?.selectAndSearch() }
+        searchHotKey?.keyDownHandler = { [weak self] in
+            Task { @MainActor in
+                self?.selectAndSearch()
+            }
+        }
     }
     
     @objc func translateScreen() {
-        Task { await performTranslate() }
+        Task { @MainActor in
+            await performTranslate()
+        }
     }
     
     @objc func selectAndSearch() {
-        Task { await performSearch() }
+        Task { @MainActor in
+            await performSearch()
+        }
     }
     
     // MARK: - Translate + Overlay
@@ -81,27 +100,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func performTranslate() async {
         do {
             let imageURL = try captureFullScreen()
-            let observations = try await performOCRWithBoxes(on: imageURL)
+            let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
             
-            guard !observations.isEmpty else {
-                await showAlert("No text found on screen.")
+            guard !items.isEmpty else {
+                showAlert("No text found on screen.")
                 return
             }
             
             var translatedItems: [(String, CGRect)] = []
-            for obs in observations {
-                guard let text = obs.topCandidates(1).first?.string, !text.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
-                let translated = try await translate(text: text, to: targetLanguage)
-                let rect = convertBoundingBox(obs.boundingBox, imageSize: NSScreen.main?.frame.size ?? .zero)
+            for item in items {
+                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let translated = try await translate(text: trimmed, to: targetLanguage)
+                let rect = convertBoundingBox(item.boundingBox, imageSize: NSScreen.main?.frame.size ?? .zero)
                 translatedItems.append((translated, rect))
             }
             
-            await MainActor.run {
-                self.showOverlay(items: translatedItems)
-            }
+            showOverlay(items: translatedItems)
         } catch {
-            await showAlert("Translate failed: \(error.localizedDescription)")
+            showAlert("Translate failed: \(error.localizedDescription)")
         }
     }
     
@@ -124,15 +142,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         
         let view = OverlayView(items: items)
-        view.onDismiss = { [weak self] in self?.dismissOverlay() }
+        view.onDismiss = { [weak self] in
+            Task { @MainActor in
+                self?.dismissOverlay()
+            }
+        }
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
         
         overlayWindow = window
         
         // Auto-dismiss after 8 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            self?.dismissOverlay()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            dismissOverlay()
         }
     }
     
@@ -146,31 +169,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func performSearch() async {
         do {
             let imageURL = try captureInteractiveRegion()
-            let observations = try await performOCRWithBoxes(on: imageURL)
+            let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
             
-            let text = observations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
+            let text = items.map { $0.text }.joined(separator: " ")
             let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
             
             guard !cleaned.isEmpty else {
-                await showAlert("No text found in selection.")
+                showAlert("No text found in selection.")
                 return
             }
             
-            await MainActor.run {
-                let query = cleaned.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cleaned
-                if let url = URL(string: "https://www.google.com/search?q=\(query)") {
-                    NSWorkspace.shared.open(url)
-                }
+            let query = cleaned.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cleaned
+            if let url = URL(string: "https://www.google.com/search?q=\(query)") {
+                NSWorkspace.shared.open(url)
             }
         } catch {
-            await showAlert("Search failed: \(error.localizedDescription)")
+            showAlert("Search failed: \(error.localizedDescription)")
         }
     }
     
     // MARK: - Helpers
     
-    func captureFullScreen() throws -> URL {
+    nonisolated func captureFullScreen() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-\(UUID().uuidString).png")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
@@ -183,7 +204,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return url
     }
     
-    func captureInteractiveRegion() throws -> URL {
+    nonisolated func captureInteractiveRegion() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-region-\(UUID().uuidString).png")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
@@ -196,7 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return url
     }
     
-    func performOCRWithBoxes(on imageURL: URL) async throws -> [VNRecognizedTextObservation] {
+    nonisolated func performOCR(on imageURL: URL) async throws -> [TextItem] {
         guard let cgImage = NSImage(contentsOf: imageURL)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to load image"])
         }
@@ -207,8 +228,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     continuation.resume(throwing: error)
                     return
                 }
-                let results = request.results as? [VNRecognizedTextObservation] ?? []
-                continuation.resume(returning: results)
+                let observations = request.results as? [VNRecognizedTextObservation] ?? []
+                let items: [TextItem] = observations.compactMap { obs in
+                    guard let text = obs.topCandidates(1).first?.string else { return nil }
+                    return TextItem(text: text, boundingBox: obs.boundingBox)
+                }
+                continuation.resume(returning: items)
             }
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
@@ -222,7 +247,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    func translate(text: String, to target: String) async throws -> String {
+    nonisolated func translate(text: String, to target: String) async throws -> String {
         let source = Locale.Language(identifier: "en")
         let targetLang = Locale.Language(identifier: target)
         
@@ -231,13 +256,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let response = try await session.translate(text)
             return response.targetText
         } else {
-            // Fallback: return original with note
             return "[macOS 26+ required] \(text)"
         }
     }
     
-    func convertBoundingBox(_ box: CGRect, imageSize: CGSize) -> CGRect {
-        // Vision: origin bottom-left, normalized. Convert to screen coordinates (origin bottom-left on macOS)
+    nonisolated func convertBoundingBox(_ box: CGRect, imageSize: CGSize) -> CGRect {
         let x = box.origin.x * imageSize.width
         let y = box.origin.y * imageSize.height
         let w = box.size.width * imageSize.width
@@ -245,13 +268,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return CGRect(x: x, y: y, width: w, height: h)
     }
     
-    func showAlert(_ message: String) async {
-        await MainActor.run {
-            let alert = NSAlert()
-            alert.messageText = "ScreenLens"
-            alert.informativeText = message
-            alert.runModal()
-        }
+    func showAlert(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "ScreenLens"
+        alert.informativeText = message
+        alert.runModal()
     }
 }
 
@@ -271,7 +292,6 @@ class OverlayView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         
-        // Semi-transparent background
         NSColor.black.withAlphaComponent(0.15).setFill()
         dirtyRect.fill()
         
@@ -286,7 +306,6 @@ class OverlayView: NSView {
         ]
         
         for (text, rect) in items {
-            // Slightly pad the rect
             let drawRect = rect.insetBy(dx: -4, dy: -2)
             let attrStr = NSAttributedString(string: text, attributes: attrs)
             attrStr.draw(in: drawRect)
