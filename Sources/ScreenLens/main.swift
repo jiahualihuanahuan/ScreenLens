@@ -134,7 +134,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func showTranslationOverlay(blocks: [TranslatedBlock]) {
-        overlayWindow?.close()
+        closeOverlaySafely()
         
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
@@ -151,26 +151,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.ignoresMouseEvents = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.hasShadow = false
+        window.isReleasedWhenClosed = false
         
         let view = TranslationOverlayView(blocks: blocks, screenFrame: frame)
         view.onDismiss = { [weak self] in
-            Task { @MainActor in
-                self?.overlayWindow?.close()
-                self?.overlayWindow = nil
-            }
+            self?.closeOverlaySafely()
         }
         
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
         overlayWindow = window
         
-        // Auto-dismiss after 10 seconds
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 10_000_000_000)
             if overlayWindow === window {
-                overlayWindow?.close()
-                overlayWindow = nil
+                closeOverlaySafely()
             }
+        }
+    }
+    
+    func closeOverlaySafely() {
+        DispatchQueue.main.async { [weak self] in
+            self?.overlayWindow?.orderOut(nil)
+            self?.overlayWindow = nil
         }
     }
     
@@ -196,7 +199,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func showWordSelectionOverlay(words: [WordBox]) {
-        selectionWindow?.close()
+        closeSelectionSafely()
         
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
@@ -213,27 +216,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.ignoresMouseEvents = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.hasShadow = false
+        window.isReleasedWhenClosed = false
         
         let view = WordSelectionView(words: words, screenFrame: frame)
         view.onComplete = { [weak self] selectedText in
-            Task { @MainActor in
-                self?.selectionWindow?.close()
-                self?.selectionWindow = nil
+            // Defer everything until after the mouse event finishes
+            DispatchQueue.main.async {
+                self?.closeSelectionSafely()
                 if let text = selectedText, !text.isEmpty {
                     self?.openGoogleSearch(query: text)
                 }
             }
         }
         view.onCancel = { [weak self] in
-            Task { @MainActor in
-                self?.selectionWindow?.close()
-                self?.selectionWindow = nil
+            DispatchQueue.main.async {
+                self?.closeSelectionSafely()
             }
         }
         
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
         selectionWindow = window
+    }
+    
+    func closeSelectionSafely() {
+        DispatchQueue.main.async { [weak self] in
+            self?.selectionWindow?.orderOut(nil)
+            self?.selectionWindow = nil
+        }
     }
     
     func openGoogleSearch(query: String) {
@@ -376,8 +386,6 @@ class TranslationOverlayView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        
-        // Light dim so original text is still faintly visible
         NSColor.black.withAlphaComponent(0.12).setFill()
         bounds.fill()
         
