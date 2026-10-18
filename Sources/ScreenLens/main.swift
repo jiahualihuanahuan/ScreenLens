@@ -45,7 +45,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenu()
         setupHotKeys()
         print("ScreenLens running. Hotkeys: ⌥⌘T live translate, ⌥⌘S word-select search")
-        print("Press ⌥⌘T again or Escape to stop live translation.")
+        print("Press ⌥⌘T again to stop live translation.")
         print("App stays running until you quit from the menu or terminal.")
     }
     
@@ -120,7 +120,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         liveTranslateTask = Task { @MainActor in
             while isLiveTranslating && !Task.isCancelled {
                 await refreshTranslation()
-                try? await Task.sleep(nanoseconds: 1_500_000_000) // refresh every 1.5s
+                try? await Task.sleep(nanoseconds: 800_000_000) // refresh every 0.8s for better tracking
             }
         }
     }
@@ -150,7 +150,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.level = .statusBar
         window.backgroundColor = .clear
         window.isOpaque = false
-        window.ignoresMouseEvents = true // click-through so you can scroll the page
+        window.ignoresMouseEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.hasShadow = false
         window.isReleasedWhenClosed = false
@@ -194,7 +194,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Word Select Search
     
     func performWordSelectSearch() async {
-        // Stop live translate if running
         if isLiveTranslating { stopLiveTranslate() }
         
         print("Word select search triggered")
@@ -246,6 +245,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.selectionWindow = nil
                 }
                 if let text = selectedText, !text.isEmpty {
+                    self?.copyToClipboard(text)
                     self?.openGoogleSearch(query: text)
                 }
             }
@@ -263,6 +263,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         selectionWindow = window
+    }
+    
+    func copyToClipboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        print("Copied to clipboard: \(text)")
     }
     
     func openGoogleSearch(query: String) {
@@ -395,9 +402,6 @@ class TranslationOverlayView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        // Very light dim so original content is still visible for scrolling
-        NSColor.black.withAlphaComponent(0.05).setFill()
-        bounds.fill()
         
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .left
@@ -406,13 +410,17 @@ class TranslationOverlayView: NSView {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .medium),
             .foregroundColor: NSColor.white,
-            .backgroundColor: NSColor.black.withAlphaComponent(0.75),
             .paragraphStyle: paragraph
         ]
         
         for block in blocks {
             let rect = convertToView(block.boundingBox)
-            let drawRect = rect.insetBy(dx: -2, dy: -1)
+            // Opaque cover to blur/hide original text
+            let coverRect = rect.insetBy(dx: -4, dy: -2)
+            NSColor.black.withAlphaComponent(0.92).setFill()
+            coverRect.fill()
+            
+            let drawRect = coverRect.insetBy(dx: 3, dy: 1)
             let attrStr = NSAttributedString(string: block.text, attributes: attrs)
             attrStr.draw(in: drawRect)
         }
@@ -423,7 +431,7 @@ class TranslationOverlayView: NSView {
         let y = normalized.origin.y * bounds.height
         let w = normalized.size.width * bounds.width
         let h = normalized.size.height * bounds.height
-        return CGRect(x: x, y: y, width: max(w, 30), height: max(h, 16))
+        return CGRect(x: x, y: y, width: max(w, 36), height: max(h, 18))
     }
 }
 
@@ -447,7 +455,7 @@ class WordSelectionView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.black.withAlphaComponent(0.1).setFill()
+        NSColor.black.withAlphaComponent(0.08).setFill()
         bounds.fill()
         
         for (i, word) in words.enumerated() {
