@@ -16,6 +16,11 @@ struct WordBox: Sendable {
     let rect: CGRect
 }
 
+struct TranslatedBlock: Sendable {
+    let text: String
+    let boundingBox: CGRect
+}
+
 // MARK: - App Delegate
 
 @MainActor
@@ -23,7 +28,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var translateHotKey: HotKey?
     var searchHotKey: HotKey?
-    var resultWindow: NSWindow?
+    var overlayWindow: NSWindow?
     var selectionWindow: NSWindow?
     var targetLanguage: String = "zh"
     
@@ -37,13 +42,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupMenu()
         setupHotKeys()
-        print("ScreenLens running. Hotkeys: ⌥⌘T translate, ⌥⌘S word-select search")
-        print("App will stay running until you quit from the menu or terminal.")
+        print("ScreenLens running. Hotkeys: ⌥⌘T in-place translate, ⌥⌘S word-select search")
+        print("App stays running until you quit from the menu or terminal.")
     }
     
     func setupMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Translate Screen (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Translate Screen In-Place (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Word Select & Search (⌥⌘S)", action: #selector(selectAndSearch), keyEquivalent: ""))
         menu.addItem(.separator())
         
@@ -94,10 +99,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - Translate
+    // MARK: - In-place Translate
     
     func performTranslate() async {
-        print("Translate triggered")
+        print("In-place translate triggered")
         do {
             let imageURL = try captureFullScreen()
             let items = try await performOCR(on: imageURL)
@@ -108,18 +113,64 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             
-            var lines: [String] = []
-            for item in items.prefix(20) {
+            var blocks: [TranslatedBlock] = []
+            for item in items.prefix(30) {
                 let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
                 let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
-                lines.append(translated)
+                blocks.append(TranslatedBlock(text: translated, boundingBox: item.boundingBox))
             }
             
-            showResultWindow(title: "Translation", text: lines.joined(separator: "\n"))
+            guard !blocks.isEmpty else {
+                showAlert("Nothing to translate.")
+                return
+            }
+            
+            showTranslationOverlay(blocks: blocks)
         } catch {
             print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
+        }
+    }
+    
+    func showTranslationOverlay(blocks: [TranslatedBlock]) {
+        overlayWindow?.close()
+        
+        guard let screen = NSScreen.main else { return }
+        let frame = screen.frame
+        
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.level = .floating
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.ignoresMouseEvents = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.hasShadow = false
+        
+        let view = TranslationOverlayView(blocks: blocks, screenFrame: frame)
+        view.onDismiss = { [weak self] in
+            Task { @MainActor in
+                self?.overlayWindow?.close()
+                self?.overlayWindow = nil
+            }
+        }
+        
+        window.contentView = view
+        window.makeKeyAndOrderFront(nil)
+        overlayWindow = window
+        
+        // Auto-dismiss after 10 seconds
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            if overlayWindow === window {
+                overlayWindow?.close()
+                overlayWindow = nil
+            }
         }
     }
     
@@ -195,33 +246,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     // MARK: - Helpers
     
-    func showResultWindow(title: String, text: String) {
-        resultWindow?.close()
-        
-        let window = NSWindow(
-            contentRect: NSRect(x: 100, y: 100, width: 480, height: 320),
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = title
-        window.level = .floating
-        
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 480, height: 320))
-        textView.string = text
-        textView.isEditable = false
-        textView.font = .systemFont(ofSize: 13)
-        
-        let scroll = NSScrollView(frame: window.contentView!.bounds)
-        scroll.documentView = textView
-        scroll.hasVerticalScroller = true
-        scroll.autoresizingMask = [.width, .height]
-        window.contentView = scroll
-        
-        window.makeKeyAndOrderFront(nil)
-        resultWindow = window
-    }
-    
     nonisolated func captureFullScreen() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-\(UUID().uuidString).png")
         let process = Process()
@@ -280,10 +304,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 for obs in observations {
                     guard let recognized = obs.topCandidates(1).first else { continue }
                     let full = recognized.string
-                    // Split into words by whitespace and get per-word boxes
                     var searchStart = full.startIndex
                     while searchStart < full.endIndex {
-                        // skip whitespace
                         while searchStart < full.endIndex && full[searchStart].isWhitespace {
                             searchStart = full.index(after: searchStart)
                         }
@@ -337,6 +359,68 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Translation Overlay View
+
+class TranslationOverlayView: NSView {
+    let blocks: [TranslatedBlock]
+    let screenFrame: CGRect
+    var onDismiss: (() -> Void)?
+    
+    init(blocks: [TranslatedBlock], screenFrame: CGRect) {
+        self.blocks = blocks
+        self.screenFrame = screenFrame
+        super.init(frame: NSRect(origin: .zero, size: screenFrame.size))
+    }
+    
+    required init?(coder: NSCoder) { fatalError() }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        
+        // Light dim so original text is still faintly visible
+        NSColor.black.withAlphaComponent(0.12).setFill()
+        bounds.fill()
+        
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byWordWrapping
+        
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.white,
+            .backgroundColor: NSColor.black.withAlphaComponent(0.8),
+            .paragraphStyle: paragraph
+        ]
+        
+        for block in blocks {
+            let rect = convertToView(block.boundingBox)
+            let drawRect = rect.insetBy(dx: -2, dy: -1)
+            let attrStr = NSAttributedString(string: block.text, attributes: attrs)
+            attrStr.draw(in: drawRect)
+        }
+    }
+    
+    private func convertToView(_ normalized: CGRect) -> CGRect {
+        let x = normalized.origin.x * bounds.width
+        let y = normalized.origin.y * bounds.height
+        let w = normalized.size.width * bounds.width
+        let h = normalized.size.height * bounds.height
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        onDismiss?()
+    }
+    
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            onDismiss?()
+        }
+    }
+    
+    override var acceptsFirstResponder: Bool { true }
+}
+
 // MARK: - Word Selection View
 
 class WordSelectionView: NSView {
@@ -359,7 +443,6 @@ class WordSelectionView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        // Very light dim
         NSColor.black.withAlphaComponent(0.08).setFill()
         bounds.fill()
         
@@ -373,7 +456,6 @@ class WordSelectionView: NSView {
     }
     
     private func convertToView(_ normalized: CGRect) -> CGRect {
-        // Vision normalized box is origin bottom-left. Convert to view coords (also bottom-left).
         let x = normalized.origin.x * bounds.width
         let y = normalized.origin.y * bounds.height
         let w = normalized.size.width * bounds.width
@@ -398,7 +480,6 @@ class WordSelectionView: NSView {
             isDragging = true
             needsDisplay = true
         } else {
-            // Clicked empty space — cancel
             onCancel?()
         }
     }
@@ -423,7 +504,7 @@ class WordSelectionView: NSView {
     }
     
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // Escape
+        if event.keyCode == 53 {
             onCancel?()
         }
     }
