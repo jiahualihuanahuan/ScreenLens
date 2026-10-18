@@ -2,6 +2,8 @@ import AppKit
 import HotKey
 import Vision
 import Translation
+import ScreenCaptureKit
+import ApplicationServices
 import Foundation
 
 // MARK: - Models
@@ -19,6 +21,13 @@ struct WordBox: Sendable {
 struct TranslatedBlock: Sendable {
     let text: String
     let boundingBox: CGRect
+}
+
+// MARK: - Non-activating Panel
+
+final class FloatingPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
 // MARK: - App Delegate
@@ -102,19 +111,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - Translate (stays until user input)
+    // MARK: - Translate
     
     func performTranslate() async {
         dismissTranslation()
         print("Translate triggered")
         
         do {
-            let imageURL = try captureFullScreen()
+            // Prefer AXUIElement region if available, else full screen
+            let region = locateActiveTextRegion()
+            let imageURL: URL
+            if let region = region {
+                print("Using focused region: \(region)")
+                imageURL = try await captureRegion(region)
+            } else {
+                imageURL = try captureFullScreen()
+            }
+            
             let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
             
             guard !items.isEmpty else {
-                showAlert("No text found on screen.")
+                showAlert("No text found.")
                 return
             }
             
@@ -131,8 +149,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             
-            showTranslationOverlay(blocks: blocks)
+            showTranslationOverlay(blocks: blocks, region: region)
             startInputMonitoring()
+            await HistoryLogger.shared.record(blocks: blocks)
             print("Translation shown. Stays until mouse move, click, or key.")
         } catch {
             print("Translate error: \(error)")
@@ -140,25 +159,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    func showTranslationOverlay(blocks: [TranslatedBlock]) {
+    func showTranslationOverlay(blocks: [TranslatedBlock], region: CGRect?) {
         overlayWindow?.orderOut(nil)
         overlayWindow = nil
         
-        guard let screen = NSScreen.main else { return }
-        let frame = screen.frame
+        let frame = region ?? NSScreen.main?.frame ?? .zero
         
-        let window = NSWindow(
+        let window = FloatingPanel(
             contentRect: frame,
-            styleMask: [.borderless],
+            styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
-            defer: false,
-            screen: screen
+            defer: false
         )
         window.level = .statusBar
         window.backgroundColor = .clear
         window.isOpaque = false
         window.ignoresMouseEvents = true
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         window.hasShadow = false
         window.isReleasedWhenClosed = false
         window.setFrame(frame, display: true)
@@ -166,7 +183,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let view = TranslationOverlayView()
         view.blocks = blocks
         window.contentView = view
-        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
         overlayWindow = window
     }
     
@@ -174,7 +191,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         isTranslating = true
         stopInputMonitors()
         
-        // Mouse move, click, scroll, and key presses dismiss the translation
         let mask: NSEvent.EventTypeMask = [
             .mouseMoved,
             .leftMouseDown,
@@ -213,7 +229,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func performWordSelectSearch() async {
         dismissTranslation()
-        
         print("Word select search triggered")
         do {
             let imageURL = try captureFullScreen()
@@ -239,12 +254,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
         
-        let window = NSWindow(
+        let window = FloatingPanel(
             contentRect: frame,
-            styleMask: [.borderless],
+            styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
-            defer: false,
-            screen: screen
+            defer: false
         )
         window.level = .statusBar
         window.backgroundColor = .clear
@@ -278,8 +292,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         window.contentView = view
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        window.orderFrontRegardless()
         selectionWindow = window
     }
     
@@ -298,7 +311,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // MARK: - Helpers
+    // MARK: - Region & Capture
+    
+    nonisolated func locateActiveTextRegion() -> CGRect? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedApp: AnyObject?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success,
+              let appElement = focusedApp as! AXUIElement? else {
+            return nil
+        }
+        
+        var targetElement: AnyObject?
+        if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &targetElement) != .success {
+            AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &targetElement)
+        }
+        
+        guard let element = targetElement as! AXUIElement? else { return nil }
+        
+        var posValue: AnyObject?
+        var sizeValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posValue) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+            return nil
+        }
+        
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(posValue as! AXValue, .cgPoint, &point)
+        AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        
+        let raw = CGRect(origin: point, size: size)
+        if raw.width > 800 && raw.height > 600 {
+            return raw.insetBy(dx: raw.width * 0.08, dy: raw.height * 0.08)
+        }
+        return raw
+    }
     
     nonisolated func captureFullScreen() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-\(UUID().uuidString).png")
@@ -311,6 +358,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             throw NSError(domain: "ScreenLens", code: 1, userInfo: [NSLocalizedDescriptionKey: "Screen capture failed. Grant Screen Recording permission."])
         }
         return url
+    }
+    
+    func captureRegion(_ rect: CGRect) async throws -> URL {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first else {
+            return try captureFullScreen()
+        }
+        
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let config = SCStreamConfiguration()
+        config.sourceRect = rect
+        config.width = Int(rect.width * 2)
+        config.height = Int(rect.height * 2)
+        config.showsCursor = false
+        
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-\(UUID().uuidString).png")
+        let rep = NSBitmapImageRep(cgImage: image)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try data.write(to: url)
+            return url
+        }
+        return try captureFullScreen()
     }
     
     nonisolated func performOCR(on imageURL: URL) async throws -> [TextItem] {
@@ -333,6 +403,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
+            request.automaticallyDetectsLanguage = true
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             do {
                 try handler.perform([request])
@@ -413,6 +484,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - History Logger
+
+actor HistoryLogger {
+    static let shared = HistoryLogger()
+    private let markdownFileURL: URL
+    private var lastHash: Int = 0
+    
+    init() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("ScreenLens", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        markdownFileURL = dir.appendingPathComponent("Translation_History.md")
+    }
+    
+    func record(blocks: [TranslatedBlock]) {
+        guard !blocks.isEmpty else { return }
+        let source = blocks.map(\.text).joined(separator: "\n")
+        let hash = source.hashValue
+        guard hash != lastHash else { return }
+        lastHash = hash
+        
+        let now = ISO8601DateFormatter().string(from: Date())
+        let entry = """
+        
+        ## \(now)
+        \(source)
+        
+        ---
+        """
+        if let data = entry.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: markdownFileURL.path),
+               let handle = try? FileHandle(forWritingTo: markdownFileURL) {
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            } else {
+                try? data.write(to: markdownFileURL, options: .atomic)
+            }
+        }
+    }
+}
+
 // MARK: - Translation Overlay View
 
 class TranslationOverlayView: NSView {
@@ -434,7 +547,7 @@ class TranslationOverlayView: NSView {
         for block in blocks {
             let rect = convertToView(block.boundingBox)
             let coverRect = rect.insetBy(dx: -4, dy: -2)
-            NSColor.black.withAlphaComponent(0.92).setFill()
+            NSColor.black.withAlphaComponent(0.88).setFill()
             coverRect.fill()
             
             let drawRect = coverRect.insetBy(dx: 3, dy: 1)
