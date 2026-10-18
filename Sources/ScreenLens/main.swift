@@ -18,8 +18,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var translateHotKey: HotKey?
     var searchHotKey: HotKey?
-    var overlayWindow: NSWindow?
-    var targetLanguage: String = "zh" // default Chinese Simplified
+    var resultWindow: NSWindow?
+    var targetLanguage: String = "zh"
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -70,103 +70,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupHotKeys() {
         translateHotKey = HotKey(key: .t, modifiers: [.option, .command])
         translateHotKey?.keyDownHandler = { [weak self] in
-            Task { @MainActor in
-                self?.translateScreen()
-            }
+            Task { @MainActor in self?.translateScreen() }
         }
         
         searchHotKey = HotKey(key: .s, modifiers: [.option, .command])
         searchHotKey?.keyDownHandler = { [weak self] in
-            Task { @MainActor in
-                self?.selectAndSearch()
-            }
+            Task { @MainActor in self?.selectAndSearch() }
         }
     }
     
     @objc func translateScreen() {
-        Task { @MainActor in
-            await performTranslate()
-        }
+        Task { @MainActor in await performTranslate() }
     }
     
     @objc func selectAndSearch() {
-        Task { @MainActor in
-            await performSearch()
-        }
+        Task { @MainActor in await performSearch() }
     }
     
-    // MARK: - Translate + Overlay
-    
     func performTranslate() async {
+        print("Translate triggered")
         do {
             let imageURL = try captureFullScreen()
+            print("Captured: \(imageURL.path)")
             let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
+            print("OCR found \(items.count) items")
             
             guard !items.isEmpty else {
                 showAlert("No text found on screen.")
                 return
             }
             
-            var translatedItems: [(String, CGRect)] = []
-            for item in items {
+            var lines: [String] = []
+            for item in items.prefix(20) { // limit to avoid overload
                 let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
-                let translated = try await translate(text: trimmed, to: targetLanguage)
-                let rect = convertBoundingBox(item.boundingBox, imageSize: NSScreen.main?.frame.size ?? .zero)
-                translatedItems.append((translated, rect))
+                let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
+                lines.append(translated)
             }
             
-            showOverlay(items: translatedItems)
+            let result = lines.joined(separator: "\n")
+            showResultWindow(title: "Translation", text: result)
         } catch {
+            print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
         }
     }
     
-    func showOverlay(items: [(String, CGRect)]) {
-        dismissOverlay()
-        
-        guard let screen = NSScreen.main else { return }
-        let frame = screen.frame
-        
-        let window = NSWindow(
-            contentRect: frame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        window.level = .screenSaver
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.ignoresMouseEvents = false
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        
-        let view = OverlayView(items: items)
-        view.onDismiss = { [weak self] in
-            Task { @MainActor in
-                self?.dismissOverlay()
-            }
-        }
-        window.contentView = view
-        window.makeKeyAndOrderFront(nil)
-        
-        overlayWindow = window
-        
-        // Auto-dismiss after 8 seconds
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
-            dismissOverlay()
-        }
-    }
-    
-    func dismissOverlay() {
-        overlayWindow?.close()
-        overlayWindow = nil
-    }
-    
-    // MARK: - Search
-    
     func performSearch() async {
+        print("Search triggered")
         do {
             let imageURL = try captureInteractiveRegion()
             let items = try await performOCR(on: imageURL)
@@ -185,11 +137,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 NSWorkspace.shared.open(url)
             }
         } catch {
+            print("Search error: \(error)")
             showAlert("Search failed: \(error.localizedDescription)")
         }
     }
     
-    // MARK: - Helpers
+    func showResultWindow(title: String, text: String) {
+        resultWindow?.close()
+        
+        let window = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 480, height: 320),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = title
+        window.level = .floating
+        
+        let textView = NSTextView(frame: window.contentView!.bounds)
+        textView.string = text
+        textView.isEditable = false
+        textView.font = .systemFont(ofSize: 13)
+        textView.autoresizingMask = [.width, .height]
+        
+        let scroll = NSScrollView(frame: window.contentView!.bounds)
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.autoresizingMask = [.width, .height]
+        window.contentView = scroll
+        
+        window.makeKeyAndOrderFront(nil)
+        resultWindow = window
+    }
     
     nonisolated func captureFullScreen() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-\(UUID().uuidString).png")
@@ -252,20 +231,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let targetLang = Locale.Language(identifier: target)
         
         if #available(macOS 26.0, *) {
-            let session = TranslationSession(installedSource: source, target: targetLang)
-            let response = try await session.translate(text)
-            return response.targetText
+            do {
+                let session = TranslationSession(installedSource: source, target: targetLang)
+                let response = try await session.translate(text)
+                return response.targetText
+            } catch {
+                print("TranslationSession error: \(error)")
+                return text // fallback to original
+            }
         } else {
             return "[macOS 26+ required] \(text)"
         }
-    }
-    
-    nonisolated func convertBoundingBox(_ box: CGRect, imageSize: CGSize) -> CGRect {
-        let x = box.origin.x * imageSize.width
-        let y = box.origin.y * imageSize.height
-        let w = box.size.width * imageSize.width
-        let h = box.size.height * imageSize.height
-        return CGRect(x: x, y: y, width: w, height: h)
     }
     
     func showAlert(_ message: String) {
@@ -274,55 +250,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = message
         alert.runModal()
     }
-}
-
-// MARK: - Overlay View
-
-class OverlayView: NSView {
-    let items: [(String, CGRect)]
-    var onDismiss: (() -> Void)?
-    
-    init(items: [(String, CGRect)]) {
-        self.items = items
-        super.init(frame: .zero)
-    }
-    
-    required init?(coder: NSCoder) { fatalError() }
-    
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        
-        NSColor.black.withAlphaComponent(0.15).setFill()
-        dirtyRect.fill()
-        
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .left
-        
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 14, weight: .medium),
-            .foregroundColor: NSColor.white,
-            .backgroundColor: NSColor.black.withAlphaComponent(0.75),
-            .paragraphStyle: paragraph
-        ]
-        
-        for (text, rect) in items {
-            let drawRect = rect.insetBy(dx: -4, dy: -2)
-            let attrStr = NSAttributedString(string: text, attributes: attrs)
-            attrStr.draw(in: drawRect)
-        }
-    }
-    
-    override func mouseDown(with event: NSEvent) {
-        onDismiss?()
-    }
-    
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // Escape
-            onDismiss?()
-        }
-    }
-    
-    override var acceptsFirstResponder: Bool { true }
 }
 
 // MARK: - Entry
