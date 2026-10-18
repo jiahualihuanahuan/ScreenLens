@@ -105,8 +105,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         print("In-place translate triggered")
         do {
             let imageURL = try captureFullScreen()
+            print("Captured screen")
             let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
+            print("OCR found \(items.count) text blocks")
             
             guard !items.isEmpty else {
                 showAlert("No text found on screen.")
@@ -126,6 +128,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             
+            print("Showing translation overlay with \(blocks.count) blocks")
             showTranslationOverlay(blocks: blocks)
         } catch {
             print("Translate error: \(error)")
@@ -134,7 +137,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func showTranslationOverlay(blocks: [TranslatedBlock]) {
-        closeOverlaySafely()
+        // Close any existing overlay first (synchronously for the old one)
+        overlayWindow?.orderOut(nil)
+        overlayWindow = nil
         
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
@@ -145,7 +150,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.level = .floating
+        window.level = .statusBar
         window.backgroundColor = .clear
         window.isOpaque = false
         window.ignoresMouseEvents = false
@@ -154,26 +159,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
         
         let view = TranslationOverlayView(blocks: blocks, screenFrame: frame)
-        view.onDismiss = { [weak self] in
-            self?.closeOverlaySafely()
+        view.onDismiss = { [weak self, weak window] in
+            DispatchQueue.main.async {
+                window?.orderOut(nil)
+                if self?.overlayWindow === window {
+                    self?.overlayWindow = nil
+                }
+            }
         }
         
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         overlayWindow = window
+        print("Translation overlay shown")
         
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
+        // Auto-dismiss after 12 seconds
+        Task { @MainActor [weak window] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
             if overlayWindow === window {
-                closeOverlaySafely()
+                window?.orderOut(nil)
+                overlayWindow = nil
             }
-        }
-    }
-    
-    func closeOverlaySafely() {
-        DispatchQueue.main.async { [weak self] in
-            self?.overlayWindow?.orderOut(nil)
-            self?.overlayWindow = nil
         }
     }
     
@@ -183,8 +190,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         print("Word select search triggered")
         do {
             let imageURL = try captureFullScreen()
+            print("Captured screen for word select")
             let words = try await extractWords(from: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
+            print("Found \(words.count) words")
             
             guard !words.isEmpty else {
                 showAlert("No words found on screen.")
@@ -199,7 +208,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func showWordSelectionOverlay(words: [WordBox]) {
-        closeSelectionSafely()
+        // Close any existing selection window first
+        selectionWindow?.orderOut(nil)
+        selectionWindow = nil
         
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
@@ -210,7 +221,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.level = .floating
+        window.level = .statusBar
         window.backgroundColor = .clear
         window.isOpaque = false
         window.ignoresMouseEvents = false
@@ -219,31 +230,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
         
         let view = WordSelectionView(words: words, screenFrame: frame)
-        view.onComplete = { [weak self] selectedText in
-            // Defer everything until after the mouse event finishes
+        view.onComplete = { [weak self, weak window] selectedText in
             DispatchQueue.main.async {
-                self?.closeSelectionSafely()
+                window?.orderOut(nil)
+                if self?.selectionWindow === window {
+                    self?.selectionWindow = nil
+                }
                 if let text = selectedText, !text.isEmpty {
                     self?.openGoogleSearch(query: text)
                 }
             }
         }
-        view.onCancel = { [weak self] in
+        view.onCancel = { [weak self, weak window] in
             DispatchQueue.main.async {
-                self?.closeSelectionSafely()
+                window?.orderOut(nil)
+                if self?.selectionWindow === window {
+                    self?.selectionWindow = nil
+                }
             }
         }
         
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
         selectionWindow = window
-    }
-    
-    func closeSelectionSafely() {
-        DispatchQueue.main.async { [weak self] in
-            self?.selectionWindow?.orderOut(nil)
-            self?.selectionWindow = nil
-        }
+        print("Word selection overlay shown — click a word and drag")
     }
     
     func openGoogleSearch(query: String) {
@@ -386,7 +397,7 @@ class TranslationOverlayView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.black.withAlphaComponent(0.12).setFill()
+        NSColor.black.withAlphaComponent(0.15).setFill()
         bounds.fill()
         
         let paragraph = NSMutableParagraphStyle()
@@ -394,15 +405,15 @@ class TranslationOverlayView: NSView {
         paragraph.lineBreakMode = .byWordWrapping
         
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
             .foregroundColor: NSColor.white,
-            .backgroundColor: NSColor.black.withAlphaComponent(0.8),
+            .backgroundColor: NSColor.black.withAlphaComponent(0.85),
             .paragraphStyle: paragraph
         ]
         
         for block in blocks {
             let rect = convertToView(block.boundingBox)
-            let drawRect = rect.insetBy(dx: -2, dy: -1)
+            let drawRect = rect.insetBy(dx: -3, dy: -2)
             let attrStr = NSAttributedString(string: block.text, attributes: attrs)
             attrStr.draw(in: drawRect)
         }
@@ -411,8 +422,8 @@ class TranslationOverlayView: NSView {
     private func convertToView(_ normalized: CGRect) -> CGRect {
         let x = normalized.origin.x * bounds.width
         let y = normalized.origin.y * bounds.height
-        let w = normalized.size.width * bounds.width
-        let h = normalized.size.height * bounds.height
+        let w = max(normalized.size.width * bounds.width, 40)
+        let h = max(normalized.size.height * bounds.height, 18)
         return CGRect(x: x, y: y, width: w, height: h)
     }
     
@@ -451,14 +462,21 @@ class WordSelectionView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.black.withAlphaComponent(0.08).setFill()
+        // Slightly stronger dim so you know the overlay is active
+        NSColor.black.withAlphaComponent(0.12).setFill()
         bounds.fill()
         
         for (i, word) in words.enumerated() {
             let rect = convertToView(word.rect)
             if selectedIndices.contains(i) {
-                NSColor.systemBlue.withAlphaComponent(0.45).setFill()
+                NSColor.systemBlue.withAlphaComponent(0.55).setFill()
                 rect.fill()
+            } else {
+                // Faint outline so you can see clickable words
+                NSColor.white.withAlphaComponent(0.15).setStroke()
+                let path = NSBezierPath(rect: rect)
+                path.lineWidth = 0.5
+                path.stroke()
             }
         }
     }
@@ -466,8 +484,8 @@ class WordSelectionView: NSView {
     private func convertToView(_ normalized: CGRect) -> CGRect {
         let x = normalized.origin.x * bounds.width
         let y = normalized.origin.y * bounds.height
-        let w = normalized.size.width * bounds.width
-        let h = normalized.size.height * bounds.height
+        let w = max(normalized.size.width * bounds.width, 20)
+        let h = max(normalized.size.height * bounds.height, 16)
         return CGRect(x: x, y: y, width: w, height: h)
     }
     
@@ -482,12 +500,15 @@ class WordSelectionView: NSView {
     
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        print("Click at \(point)")
         if let idx = indexOfWord(at: point) {
+            print("Selected word: \(words[idx].word)")
             anchorIndex = idx
             selectedIndices = [idx]
             isDragging = true
             needsDisplay = true
         } else {
+            print("Clicked empty space — cancelling")
             onCancel?()
         }
     }
@@ -508,6 +529,7 @@ class WordSelectionView: NSView {
         isDragging = false
         let sorted = selectedIndices.sorted()
         let text = sorted.map { words[$0].word }.joined(separator: " ")
+        print("Selection complete: \(text)")
         onComplete?(text.isEmpty ? nil : text)
     }
     
