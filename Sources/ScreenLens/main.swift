@@ -11,6 +11,11 @@ struct TextItem: Sendable {
     let boundingBox: CGRect
 }
 
+struct WordBox: Sendable {
+    let word: String
+    let rect: CGRect
+}
+
 // MARK: - App Delegate
 
 @MainActor
@@ -19,6 +24,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var translateHotKey: HotKey?
     var searchHotKey: HotKey?
     var resultWindow: NSWindow?
+    var selectionWindow: NSWindow?
     var targetLanguage: String = "zh"
     
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -31,13 +37,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupMenu()
         setupHotKeys()
-        print("ScreenLens running. Hotkeys: ⌥⌘T translate, ⌥⌘S search")
+        print("ScreenLens running. Hotkeys: ⌥⌘T translate, ⌥⌘S word-select search")
+        print("App will stay running until you quit from the menu or terminal.")
     }
     
     func setupMenu() {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Translate Screen (⌥⌘T)", action: #selector(translateScreen), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Select & Search (⌥⌘S)", action: #selector(selectAndSearch), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Word Select & Search (⌥⌘S)", action: #selector(selectAndSearch), keyEquivalent: ""))
         menu.addItem(.separator())
         
         let langMenu = NSMenu()
@@ -84,17 +91,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     @objc func selectAndSearch() {
-        Task { @MainActor in await performSearch() }
+        Task { @MainActor in await performWordSelectSearch() }
     }
+    
+    // MARK: - Translate
     
     func performTranslate() async {
         print("Translate triggered")
         do {
             let imageURL = try captureFullScreen()
-            print("Captured: \(imageURL.path)")
             let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
-            print("OCR found \(items.count) items")
             
             guard !items.isEmpty else {
                 showAlert("No text found on screen.")
@@ -102,45 +109,91 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             
             var lines: [String] = []
-            for item in items.prefix(20) { // limit to avoid overload
+            for item in items.prefix(20) {
                 let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
                 let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
                 lines.append(translated)
             }
             
-            let result = lines.joined(separator: "\n")
-            showResultWindow(title: "Translation", text: result)
+            showResultWindow(title: "Translation", text: lines.joined(separator: "\n"))
         } catch {
             print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
         }
     }
     
-    func performSearch() async {
-        print("Search triggered")
+    // MARK: - Word Select Search
+    
+    func performWordSelectSearch() async {
+        print("Word select search triggered")
         do {
-            let imageURL = try captureInteractiveRegion()
-            let items = try await performOCR(on: imageURL)
+            let imageURL = try captureFullScreen()
+            let words = try await extractWords(from: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
             
-            let text = items.map { $0.text }.joined(separator: " ")
-            let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            
-            guard !cleaned.isEmpty else {
-                showAlert("No text found in selection.")
+            guard !words.isEmpty else {
+                showAlert("No words found on screen.")
                 return
             }
             
-            let query = cleaned.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? cleaned
-            if let url = URL(string: "https://www.google.com/search?q=\(query)") {
-                NSWorkspace.shared.open(url)
-            }
+            showWordSelectionOverlay(words: words)
         } catch {
-            print("Search error: \(error)")
-            showAlert("Search failed: \(error.localizedDescription)")
+            print("Word select error: \(error)")
+            showAlert("Failed to start word selection: \(error.localizedDescription)")
         }
     }
+    
+    func showWordSelectionOverlay(words: [WordBox]) {
+        selectionWindow?.close()
+        
+        guard let screen = NSScreen.main else { return }
+        let frame = screen.frame
+        
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.level = .floating
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.ignoresMouseEvents = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.hasShadow = false
+        
+        let view = WordSelectionView(words: words, screenFrame: frame)
+        view.onComplete = { [weak self] selectedText in
+            Task { @MainActor in
+                self?.selectionWindow?.close()
+                self?.selectionWindow = nil
+                if let text = selectedText, !text.isEmpty {
+                    self?.openGoogleSearch(query: text)
+                }
+            }
+        }
+        view.onCancel = { [weak self] in
+            Task { @MainActor in
+                self?.selectionWindow?.close()
+                self?.selectionWindow = nil
+            }
+        }
+        
+        window.contentView = view
+        window.makeKeyAndOrderFront(nil)
+        selectionWindow = window
+    }
+    
+    func openGoogleSearch(query: String) {
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        if let url = URL(string: "https://www.google.com/search?q=\(encoded)") {
+            NSWorkspace.shared.open(url)
+            print("Opened search for: \(query)")
+        }
+    }
+    
+    // MARK: - Helpers
     
     func showResultWindow(title: String, text: String) {
         resultWindow?.close()
@@ -154,11 +207,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = title
         window.level = .floating
         
-        let textView = NSTextView(frame: window.contentView!.bounds)
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 480, height: 320))
         textView.string = text
         textView.isEditable = false
         textView.font = .systemFont(ofSize: 13)
-        textView.autoresizingMask = [.width, .height]
         
         let scroll = NSScrollView(frame: window.contentView!.bounds)
         scroll.documentView = textView
@@ -183,19 +235,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return url
     }
     
-    nonisolated func captureInteractiveRegion() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-region-\(UUID().uuidString).png")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = ["-i", "-x", url.path]
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: url.path) else {
-            throw NSError(domain: "ScreenLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "Selection cancelled or failed."])
-        }
-        return url
-    }
-    
     nonisolated func performOCR(on imageURL: URL) async throws -> [TextItem] {
         guard let cgImage = NSImage(contentsOf: imageURL)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to load image"])
@@ -216,7 +255,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
-            
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+    
+    nonisolated func extractWords(from imageURL: URL) async throws -> [WordBox] {
+        guard let cgImage = NSImage(contentsOf: imageURL)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to load image"])
+        }
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            let request = VNRecognizeTextRequest { request, error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                var words: [WordBox] = []
+                let observations = request.results as? [VNRecognizedTextObservation] ?? []
+                for obs in observations {
+                    guard let recognized = obs.topCandidates(1).first else { continue }
+                    let full = recognized.string
+                    // Split into words by whitespace and get per-word boxes
+                    var searchStart = full.startIndex
+                    while searchStart < full.endIndex {
+                        // skip whitespace
+                        while searchStart < full.endIndex && full[searchStart].isWhitespace {
+                            searchStart = full.index(after: searchStart)
+                        }
+                        if searchStart >= full.endIndex { break }
+                        var wordEnd = searchStart
+                        while wordEnd < full.endIndex && !full[wordEnd].isWhitespace {
+                            wordEnd = full.index(after: wordEnd)
+                        }
+                        let range = searchStart..<wordEnd
+                        let word = String(full[range])
+                        if let box = try? recognized.boundingBox(for: range) {
+                            words.append(WordBox(word: word, rect: box.boundingBox))
+                        }
+                        searchStart = wordEnd
+                    }
+                }
+                continuation.resume(returning: words)
+            }
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             do {
                 try handler.perform([request])
@@ -229,18 +316,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     nonisolated func translate(text: String, to target: String) async throws -> String {
         let source = Locale.Language(identifier: "en")
         let targetLang = Locale.Language(identifier: target)
-        
         if #available(macOS 26.0, *) {
             do {
                 let session = TranslationSession(installedSource: source, target: targetLang)
                 let response = try await session.translate(text)
                 return response.targetText
             } catch {
-                print("TranslationSession error: \(error)")
-                return text // fallback to original
+                return text
             }
         } else {
-            return "[macOS 26+ required] \(text)"
+            return text
         }
     }
     
@@ -250,6 +335,100 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = message
         alert.runModal()
     }
+}
+
+// MARK: - Word Selection View
+
+class WordSelectionView: NSView {
+    let words: [WordBox]
+    let screenFrame: CGRect
+    var onComplete: ((String?) -> Void)?
+    var onCancel: (() -> Void)?
+    
+    private var selectedIndices: Set<Int> = []
+    private var anchorIndex: Int?
+    private var isDragging = false
+    
+    init(words: [WordBox], screenFrame: CGRect) {
+        self.words = words
+        self.screenFrame = screenFrame
+        super.init(frame: NSRect(origin: .zero, size: screenFrame.size))
+    }
+    
+    required init?(coder: NSCoder) { fatalError() }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        // Very light dim
+        NSColor.black.withAlphaComponent(0.08).setFill()
+        bounds.fill()
+        
+        for (i, word) in words.enumerated() {
+            let rect = convertToView(word.rect)
+            if selectedIndices.contains(i) {
+                NSColor.systemBlue.withAlphaComponent(0.45).setFill()
+                rect.fill()
+            }
+        }
+    }
+    
+    private func convertToView(_ normalized: CGRect) -> CGRect {
+        // Vision normalized box is origin bottom-left. Convert to view coords (also bottom-left).
+        let x = normalized.origin.x * bounds.width
+        let y = normalized.origin.y * bounds.height
+        let w = normalized.size.width * bounds.width
+        let h = normalized.size.height * bounds.height
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+    
+    private func indexOfWord(at point: NSPoint) -> Int? {
+        for (i, word) in words.enumerated() {
+            if convertToView(word.rect).contains(point) {
+                return i
+            }
+        }
+        return nil
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if let idx = indexOfWord(at: point) {
+            anchorIndex = idx
+            selectedIndices = [idx]
+            isDragging = true
+            needsDisplay = true
+        } else {
+            // Clicked empty space — cancel
+            onCancel?()
+        }
+    }
+    
+    override func mouseDragged(with event: NSEvent) {
+        guard isDragging, let anchor = anchorIndex else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        if let current = indexOfWord(at: point) {
+            let low = min(anchor, current)
+            let high = max(anchor, current)
+            selectedIndices = Set(low...high)
+            needsDisplay = true
+        }
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        guard isDragging else { return }
+        isDragging = false
+        let sorted = selectedIndices.sorted()
+        let text = sorted.map { words[$0].word }.joined(separator: " ")
+        onComplete?(text.isEmpty ? nil : text)
+    }
+    
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { // Escape
+            onCancel?()
+        }
+    }
+    
+    override var acceptsFirstResponder: Bool { true }
 }
 
 // MARK: - Entry
