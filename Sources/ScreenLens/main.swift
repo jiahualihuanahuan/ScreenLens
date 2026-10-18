@@ -2,6 +2,7 @@ import AppKit
 import HotKey
 import Vision
 import Translation
+import ScreenCaptureKit
 import Foundation
 
 // MARK: - Models
@@ -185,18 +186,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func checkForScreenChange() async {
-        // Capture content *under* the overlay so we never hide it
         guard let window = overlayWindow else { return }
         let windowID = CGWindowID(window.windowNumber)
         
         do {
-            let signature = try captureUnderlaySignature(excludingWindow: windowID)
+            let signature = try await captureUnderlaySignature(excludingWindow: windowID)
             let changed = signatureChanged(baseline: baselineSignature, current: signature)
             if changed {
                 print("Screen changed significantly — dismissing translation")
                 stopMonitoring()
             }
-            // No else: overlay stays visible the whole time
         } catch {
             print("Change check error: \(error)")
         }
@@ -315,23 +314,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return url
     }
     
-    /// Capture content under the overlay window (excludes our translation layer).
-    nonisolated func captureUnderlaySignature(excludingWindow windowID: CGWindowID) throws -> [UInt8] {
-        guard let screen = NSScreen.main else {
-            throw NSError(domain: "ScreenLens", code: 6, userInfo: [NSLocalizedDescriptionKey: "No main screen"])
-        }
-        let rect = screen.frame
-        
-        // Capture everything on screen below our overlay window
-        guard let image = CGWindowListCreateImage(
-            rect,
-            .optionOnScreenBelowWindow,
-            windowID,
-            [.bestResolution, .boundsIgnoreFraming]
-        ) else {
-            throw NSError(domain: "ScreenLens", code: 7, userInfo: [NSLocalizedDescriptionKey: "Underlay capture failed"])
+    /// Capture content under the overlay using ScreenCaptureKit (excludes our window).
+    func captureUnderlaySignature(excludingWindow windowID: CGWindowID) async throws -> [UInt8] {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first else {
+            throw NSError(domain: "ScreenLens", code: 6, userInfo: [NSLocalizedDescriptionKey: "No display found"])
         }
         
+        // Find our overlay window in the shareable content so we can exclude it
+        let exclude = content.windows.filter { $0.windowID == windowID }
+        let filter = SCContentFilter(display: display, excludingWindows: exclude)
+        
+        let config = SCStreamConfiguration()
+        config.width = 48
+        config.height = 27
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.showsCursor = false
+        
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         return try signatureFromCGImage(image)
     }
     
