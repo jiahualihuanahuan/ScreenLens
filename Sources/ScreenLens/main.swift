@@ -2,7 +2,6 @@ import AppKit
 import HotKey
 import Vision
 import Translation
-import ScreenCaptureKit
 import Foundation
 
 // MARK: - Models
@@ -32,9 +31,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var overlayWindow: NSWindow?
     var selectionWindow: NSWindow?
     var targetLanguage: String = "zh"
-    var monitorTask: Task<Void, Never>?
+    var inputMonitors: [Any] = []
     var isTranslating = false
-    var baselineSignature: [UInt8] = []
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -47,7 +45,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenu()
         setupHotKeys()
         print("ScreenLens running. Hotkeys: ⌥⌘T translate, ⌥⌘S word-select search")
-        print("Translation stays until the screen meaningfully changes.")
+        print("Translation stays until you move the mouse, click, or type.")
         print("App stays running until you quit from the menu or terminal.")
     }
     
@@ -104,15 +102,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - One-shot Translate with change monitoring
+    // MARK: - Translate (stays until user input)
     
     func performTranslate() async {
-        stopMonitoring()
+        dismissTranslation()
         print("Translate triggered")
         
         do {
             let imageURL = try captureFullScreen()
-            let signature = try imageSignature(from: imageURL)
             let items = try await performOCR(on: imageURL)
             try? FileManager.default.removeItem(at: imageURL)
             
@@ -134,10 +131,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             
-            baselineSignature = signature
             showTranslationOverlay(blocks: blocks)
-            startChangeMonitoring()
-            print("Translation shown. Monitoring underlay for changes...")
+            startInputMonitoring()
+            print("Translation shown. Stays until mouse move, click, or key.")
         } catch {
             print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
@@ -174,46 +170,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         overlayWindow = window
     }
     
-    func startChangeMonitoring() {
+    func startInputMonitoring() {
         isTranslating = true
-        monitorTask = Task { @MainActor in
-            while isTranslating && !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                guard isTranslating else { break }
-                await checkForScreenChange()
-            }
-        }
-    }
-    
-    func checkForScreenChange() async {
-        guard let window = overlayWindow else { return }
-        let windowID = CGWindowID(window.windowNumber)
+        stopInputMonitors()
         
-        do {
-            let signature = try await captureUnderlaySignature(excludingWindow: windowID)
-            let changed = signatureChanged(baseline: baselineSignature, current: signature)
-            if changed {
-                print("Screen changed significantly — dismissing translation")
-                stopMonitoring()
+        // Mouse move, click, scroll, and key presses dismiss the translation
+        let mask: NSEvent.EventTypeMask = [
+            .mouseMoved,
+            .leftMouseDown,
+            .rightMouseDown,
+            .otherMouseDown,
+            .scrollWheel,
+            .keyDown
+        ]
+        
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+            Task { @MainActor in
+                self?.dismissTranslation()
             }
-        } catch {
-            print("Change check error: \(error)")
+        }) {
+            inputMonitors.append(monitor)
         }
     }
     
-    func stopMonitoring() {
+    func stopInputMonitors() {
+        for monitor in inputMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        inputMonitors.removeAll()
+    }
+    
+    func dismissTranslation() {
+        guard isTranslating || overlayWindow != nil else { return }
+        print("User input detected — dismissing translation")
         isTranslating = false
-        monitorTask?.cancel()
-        monitorTask = nil
+        stopInputMonitors()
         overlayWindow?.orderOut(nil)
         overlayWindow = nil
-        baselineSignature = []
     }
     
     // MARK: - Word Select Search
     
     func performWordSelectSearch() async {
-        stopMonitoring()
+        dismissTranslation()
         
         print("Word select search triggered")
         do {
@@ -312,67 +311,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             throw NSError(domain: "ScreenLens", code: 1, userInfo: [NSLocalizedDescriptionKey: "Screen capture failed. Grant Screen Recording permission."])
         }
         return url
-    }
-    
-    /// Capture content under the overlay using ScreenCaptureKit (excludes our window).
-    func captureUnderlaySignature(excludingWindow windowID: CGWindowID) async throws -> [UInt8] {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else {
-            throw NSError(domain: "ScreenLens", code: 6, userInfo: [NSLocalizedDescriptionKey: "No display found"])
-        }
-        
-        // Find our overlay window in the shareable content so we can exclude it
-        let exclude = content.windows.filter { $0.windowID == windowID }
-        let filter = SCContentFilter(display: display, excludingWindows: exclude)
-        
-        let config = SCStreamConfiguration()
-        config.width = 48
-        config.height = 27
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.showsCursor = false
-        
-        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        return try signatureFromCGImage(image)
-    }
-    
-    nonisolated func imageSignature(from imageURL: URL) throws -> [UInt8] {
-        guard let image = NSImage(contentsOf: imageURL),
-              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            throw NSError(domain: "ScreenLens", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to read image for signature"])
-        }
-        return try signatureFromCGImage(cg)
-    }
-    
-    nonisolated func signatureFromCGImage(_ cg: CGImage) throws -> [UInt8] {
-        let width = 48
-        let height = 27
-        var pixels = [UInt8](repeating: 0, count: width * height)
-        
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-        guard let ctx = CGContext(
-            data: &pixels,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        ) else {
-            throw NSError(domain: "ScreenLens", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to create signature context"])
-        }
-        
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
-        return pixels
-    }
-    
-    nonisolated func signatureChanged(baseline: [UInt8], current: [UInt8]) -> Bool {
-        guard baseline.count == current.count, !baseline.isEmpty else { return false }
-        var diffSum: Int = 0
-        for i in 0..<baseline.count {
-            diffSum += abs(Int(baseline[i]) - Int(current[i]))
-        }
-        let avgDiff = Double(diffSum) / Double(baseline.count)
-        return avgDiff > 12.0
     }
     
     nonisolated func performOCR(on imageURL: URL) async throws -> [TextItem] {
