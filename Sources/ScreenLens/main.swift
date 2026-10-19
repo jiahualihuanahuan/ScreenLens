@@ -11,27 +11,34 @@ import Foundation
 
 struct TextItem: Sendable {
     let text: String
-    let boundingBox: CGRect
+    let boundingBox: CGRect // Vision normalized (0...1, bottom-left origin)
+    let avgLineHeight: CGFloat
 }
 
 struct WordBox: Sendable {
     let word: String
-    let rect: CGRect
+    let rect: CGRect // Vision normalized (0...1, bottom-left origin)
 }
 
 struct TranslatedBlock: Sendable {
     let sourceText: String
     let translatedText: String
-    let boundingBox: CGRect
+    let boundingBox: CGRect // Vision normalized (0...1, bottom-left origin)
+    let avgLineHeight: CGFloat
 }
 
-// MARK: - Non-activating Panel
+// MARK: - Non-Constrained Floating Panel
 
 final class FloatingPanel: NSPanel {
     var allowsKey: Bool = false
     
     override var canBecomeKey: Bool { allowsKey }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool { allowsKey }
+    
+    // CRITICAL: Stop macOS from shifting or shrinking the overlay window around the Dock/Menu Bar
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        return frameRect
+    }
 }
 
 // MARK: - App Delegate (Menu Bar Tool)
@@ -50,14 +57,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var isTranslating = false
     var recentHistory: [(source: String, target: String)] = []
     
-    // Menu items that update dynamically
     private var axStatusItem: NSMenuItem!
     private var screenStatusItem: NSMenuItem!
     private var historySubmenu: NSMenu!
     private var launchAtLoginItem: NSMenuItem!
     
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 隐藏 Dock 图标，作为纯 Menu Bar 应用运行
         NSApp.setActivationPolicy(.accessory)
         
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -81,7 +86,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(headerItem)
         menu.addItem(.separator())
         
-        // 核心功能操作区
         let activeTranslateItem = NSMenuItem(title: "Translate Active Window", action: #selector(translateScreen), keyEquivalent: "t")
         activeTranslateItem.keyEquivalentModifierMask = [.option, .command]
         activeTranslateItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
@@ -103,7 +107,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         menu.addItem(.separator())
         
-        // 目标语言切换子菜单
         let langMenu = NSMenu()
         let languages: [(title: String, code: String)] = [
             ("Simplified Chinese (简体中文)", "zh-Hans"),
@@ -126,7 +129,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         langItem.submenu = langMenu
         menu.addItem(langItem)
         
-        // 最近翻译记录 & Markdown 历史文件
         historySubmenu = NSMenu()
         let historyMenuItem = NSMenuItem(title: "Recent Translations", action: nil, keyEquivalent: "")
         historyMenuItem.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: nil)
@@ -136,7 +138,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         menu.addItem(.separator())
         
-        // 权限状态实时指示器
         axStatusItem = NSMenuItem(title: "Checking Accessibility...", action: #selector(openAccessibilitySettings), keyEquivalent: "")
         menu.addItem(axStatusItem)
         
@@ -145,7 +146,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         menu.addItem(.separator())
         
-        // 开机自启与退出
         launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         menu.addItem(launchAtLoginItem)
         
@@ -154,7 +154,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
     
-    // 每次点开菜单栏图标时动态刷新权限与自启状态
     func menuWillOpen(_ menu: NSMenu) {
         let axTrusted = AXIsProcessTrusted()
         axStatusItem.title = axTrusted ? "Accessibility: Granted" : "Accessibility: Click to Grant..."
@@ -257,7 +256,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try SMAppService.mainApp.register()
             }
         } catch {
-            showAlert("Could not update Launch at Login: \(error.localizedDescription)\nMake sure ScreenLens is packaged inside /Applications/ScreenLens.app.")
+            showAlert("Could not update Launch at Login: \(error.localizedDescription)")
         }
     }
     
@@ -290,8 +289,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - Status Icon Visual Feedback
-    
     func setStatusLoading(_ loading: Bool) {
         if let button = statusItem.button {
             button.image = NSImage(
@@ -303,17 +300,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     // MARK: - Coordinate Conversion (Quartz Top-Left <-> AppKit Bottom-Left)
     
-    func screenContaining(_ rect: CGRect) -> NSScreen {
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        return NSScreen.screens.first { $0.frame.contains(center) } ?? NSScreen.main ?? NSScreen.screens.first!
-    }
-    
     func quartzToAppKit(_ quartzRect: CGRect) -> CGRect {
-        // Quartz is top-left of primary; AppKit is bottom-left of primary.
-        // Use the screen that actually contains the rect so external displays work.
-        let screen = screenContaining(quartzRect)
-        let screenTop = screen.frame.maxY
-        let appKitY = screenTop - quartzRect.origin.y - quartzRect.height
+        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 1080
+        let appKitY = primaryScreenHeight - quartzRect.origin.y - quartzRect.height
         return CGRect(
             x: quartzRect.origin.x,
             y: appKitY,
@@ -323,15 +312,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     
     func appKitToQuartz(_ appKitRect: CGRect) -> CGRect {
-        let screen = screenContaining(appKitRect)
-        let screenTop = screen.frame.maxY
-        let quartzY = screenTop - appKitRect.maxY
+        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 1080
+        let quartzY = primaryScreenHeight - appKitRect.maxY
         return CGRect(
             x: appKitRect.origin.x,
             y: quartzY,
             width: appKitRect.width,
             height: appKitRect.height
         )
+    }
+    
+    /// Find the NSScreen that contains the given Quartz rect
+    func screenContaining(quartzRect: CGRect) -> NSScreen {
+        let appKitRect = quartzToAppKit(quartzRect)
+        for screen in NSScreen.screens {
+            if screen.frame.intersects(appKitRect) {
+                return screen
+            }
+        }
+        return NSScreen.main ?? NSScreen.screens[0]
     }
     
     // MARK: - 1. Translate Active Window (⌥⌘T)
@@ -351,20 +350,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     func startAreaSelectionForTranslation() {
         dismissTranslation()
-        selectionWindow?.orderOut(nil)
-        selectionWindow = nil
+        closeSelectionWindow()
         
-        guard let screen = NSScreen.main else { return }
+        let mouseLoc = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens[0]
         let screenFrame = screen.frame
         
         let window = FloatingPanel(
             contentRect: screenFrame,
-            styleMask: [.nonactivatingPanel, .borderless],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         window.allowsKey = true
-        window.level = .statusBar
+        window.level = .screenSaver
         window.backgroundColor = .clear
         window.isOpaque = false
         window.ignoresMouseEvents = false
@@ -374,36 +373,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.setFrame(screenFrame, display: true)
         
         let view = AreaCaptureView(frame: NSRect(origin: .zero, size: screenFrame.size))
-        view.onSelectRect = { [weak self, weak window] selectedViewRect in
+        view.onSelectRect = { [weak self] selectedTopLeftRect in
             Task { @MainActor in
-                window?.orderOut(nil)
-                if self?.selectionWindow === window { self?.selectionWindow = nil }
-                guard let self = self, let rect = selectedViewRect, rect.width > 24, rect.height > 16 else { return }
-                let screenRect = CGRect(
-                    x: screenFrame.origin.x + rect.origin.x,
-                    y: screenFrame.origin.y + rect.origin.y,
+                self?.closeSelectionWindow()
+                guard let self = self, let rect = selectedTopLeftRect, rect.width > 20, rect.height > 14 else { return }
+                let screenQuartz = self.appKitToQuartz(screenFrame)
+                let targetQuartz = CGRect(
+                    x: screenQuartz.origin.x + rect.origin.x,
+                    y: screenQuartz.origin.y + rect.origin.y,
                     width: rect.width,
                     height: rect.height
                 )
-                let quartzRect = self.appKitToQuartz(screenRect)
-                try? await Task.sleep(nanoseconds: 80_000_000) // 等待选框图层彻底消失
-                await self.translateQuartzRegion(quartzRect)
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                await self.translateQuartzRegion(targetQuartz)
             }
         }
         
         window.contentView = view
-        window.orderFrontRegardless()
-        window.makeKey()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(view)
         selectionWindow = window
     }
     
-    func translateQuartzRegion(_ quartzRegion: CGRect) async {
+    func translateQuartzRegion(_ requestedQuartzRegion: CGRect) async {
         setStatusLoading(true)
         defer { setStatusLoading(false) }
         
         do {
-            let cgImage = try await captureRegionImage(quartzRegion)
+            let (cgImage, actualQuartzRegion) = try await captureRegionImage(requestedQuartzRegion)
             let rawItems = try await performOCR(on: cgImage)
             let mergedParagraphs = mergeIntoParagraphs(rawItems)
             
@@ -415,11 +413,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let blocks = await translateBatch(items: mergedParagraphs, to: targetLanguage)
             guard !blocks.isEmpty else { return }
             
-            let appKitRegion = quartzToAppKit(quartzRegion)
+            // Use the exact clamped Quartz region that was captured so 0...1 coordinates match 1:1
+            let appKitRegion = quartzToAppKit(actualQuartzRegion)
             showTranslationOverlay(blocks: blocks, appKitRegion: appKitRegion)
             startInputMonitoring()
             
-            // 更新菜单栏最近记录并写入本地 Markdown
             let combinedSrc = blocks.map(\.sourceText).joined(separator: "\n")
             let combinedTgt = blocks.map(\.translatedText).joined(separator: "\n")
             recentHistory.insert((source: combinedSrc, target: combinedTgt), at: 0)
@@ -447,13 +445,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.isOpaque = false
         window.ignoresMouseEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        window.hasShadow = true
+        window.hasShadow = false
         window.isReleasedWhenClosed = false
-        window.setFrame(appKitRegion, display: true)
         
         let view = TranslationOverlayView(frame: NSRect(origin: .zero, size: appKitRegion.size))
         view.blocks = blocks
         window.contentView = view
+        window.setFrame(appKitRegion, display: true)
         window.orderFrontRegardless()
         overlayWindow = window
     }
@@ -494,18 +492,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         overlayWindow = nil
     }
     
-    // MARK: - 3. Word Select Search (⌥⌘S)
+    func closeSelectionWindow() {
+        selectionWindow?.orderOut(nil)
+        selectionWindow = nil
+    }
+    
+    // MARK: - 3. Word Select & Search (⌥⌘S)
     
     func performWordSelectSearch() async {
         dismissTranslation()
-        guard let screen = NSScreen.main else { return }
+        closeSelectionWindow()
+        
+        let mouseLoc = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens[0]
+        let screenFrame = screen.frame
         
         setStatusLoading(true)
         defer { setStatusLoading(false) }
         
         do {
-            let quartzScreenRect = appKitToQuartz(screen.frame)
-            let cgImage = try await captureRegionImage(quartzScreenRect)
+            let quartzScreenRect = appKitToQuartz(screenFrame)
+            let (cgImage, actualQuartzRect) = try await captureRegionImage(quartzScreenRect)
             let words = try await extractWords(from: cgImage)
             
             guard !words.isEmpty else {
@@ -513,54 +520,53 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             
-            showWordSelectionOverlay(words: words, screenFrame: screen.frame)
+            let actualAppKitFrame = quartzToAppKit(actualQuartzRect)
+            showWordSelectionOverlay(words: words, screenFrame: actualAppKitFrame)
         } catch {
             showAlert("Failed to start word selection: \(error.localizedDescription)")
         }
     }
     
     func showWordSelectionOverlay(words: [WordBox], screenFrame: CGRect) {
-        selectionWindow?.orderOut(nil)
-        selectionWindow = nil
+        closeSelectionWindow()
         
         let window = FloatingPanel(
             contentRect: screenFrame,
-            styleMask: [.nonactivatingPanel, .borderless],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         window.allowsKey = true
-        window.level = .statusBar
+        window.level = .screenSaver
         window.backgroundColor = .clear
         window.isOpaque = false
         window.ignoresMouseEvents = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.hasShadow = false
         window.isReleasedWhenClosed = false
-        window.setFrame(screenFrame, display: true)
         
         let view = WordSelectionView(words: words, frame: NSRect(origin: .zero, size: screenFrame.size))
-        view.onComplete = { [weak self, weak window] selectedText in
+        view.onComplete = { [weak self] selectedText in
             Task { @MainActor in
-                window?.orderOut(nil)
-                if self?.selectionWindow === window { self?.selectionWindow = nil }
-                if let text = selectedText, !text.isEmpty {
+                self?.closeSelectionWindow()
+                if let text = selectedText?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
                     self?.copyToClipboard(text)
                     self?.openGoogleSearch(query: text)
                 }
             }
         }
-        view.onCancel = { [weak self, weak window] in
+        view.onCancel = { [weak self] in
             Task { @MainActor in
-                window?.orderOut(nil)
-                if self?.selectionWindow === window { self?.selectionWindow = nil }
+                self?.closeSelectionWindow()
             }
         }
         
         window.contentView = view
-        window.orderFrontRegardless()
+        window.setFrame(screenFrame, display: true)
+        
+        // Activate app so mouse clicks, drags, and Escape key are immediately received
         NSApp.activate(ignoringOtherApps: true)
-        window.makeKey()
+        window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(view)
         selectionWindow = window
     }
@@ -572,13 +578,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     
     func openGoogleSearch(query: String) {
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        if let url = URL(string: "https://www.google.com/search?q=\(encoded)") {
+        var components = URLComponents(string: "https://www.google.com/search")
+        components?.queryItems = [URLQueryItem(name: "q", value: query)]
+        if let url = components?.url {
             NSWorkspace.shared.open(url)
         }
     }
     
-    // MARK: - Robust Region Locator (Supports Brave / Chrome / Electron + WindowServer)
+    // MARK: - Robust Region Locator
     
     func locateActiveTextRegion() -> CGRect? {
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -643,31 +650,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         
-        guard var finalRect = rawRect else { return nil }
-        
-        if finalRect.width > 400 && finalRect.height > 300 {
-            let topInset = min(max(finalRect.height * 0.08, 72), 96)
-            let bottomInset = finalRect.height * 0.03
-            let sideInset = finalRect.width * 0.03
-            finalRect = CGRect(
-                x: finalRect.origin.x + sideInset,
-                y: finalRect.origin.y + topInset,
-                width: finalRect.width - sideInset * 2,
-                height: finalRect.height - topInset - bottomInset
-            )
-        }
-        
-        guard finalRect.width > 80, finalRect.height > 40 else { return nil }
+        guard let finalRect = rawRect, finalRect.width > 80, finalRect.height > 40 else { return nil }
         return finalRect
     }
     
-    // MARK: - Screen Capture
+    // MARK: - 1:1 Clamped Screen Capture
     
-    func captureRegionImage(_ quartzRect: CGRect) async throws -> CGImage {
+    func captureRegionImage(_ quartzRect: CGRect) async throws -> (CGImage, CGRect) {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first(where: { $0.frame.intersects(quartzRect) }) ?? content.displays.first else {
             throw NSError(domain: "ScreenLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "No display found"])
         }
+        
+        // Strictly clamp the capture region to the physical display frame so ScreenCaptureKit never stretches or resets sourceRect
+        let clampedQuartz = quartzRect.intersection(display.frame).integral
+        guard clampedQuartz.width > 32, clampedQuartz.height > 32 else {
+            throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Capture region outside screen bounds"])
+        }
+        
+        let screen = screenContaining(quartzRect: clampedQuartz)
+        let scale = screen.backingScaleFactor
         
         let ownPID = ProcessInfo.processInfo.processIdentifier
         let excludedWindows = content.windows.filter { $0.owningApplication?.processID == ownPID }
@@ -676,20 +678,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let config = SCStreamConfiguration()
         
         let localRect = CGRect(
-            x: quartzRect.origin.x - display.frame.origin.x,
-            y: quartzRect.origin.y - display.frame.origin.y,
-            width: quartzRect.width,
-            height: quartzRect.height
+            x: clampedQuartz.origin.x - display.frame.origin.x,
+            y: clampedQuartz.origin.y - display.frame.origin.y,
+            width: clampedQuartz.width,
+            height: clampedQuartz.height
         )
         config.sourceRect = localRect
-        config.width = Int(localRect.width * 2)
-        config.height = Int(localRect.height * 2)
+        config.width = Int(localRect.width * scale)
+        config.height = Int(localRect.height * scale)
         config.showsCursor = false
         
-        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        return (image, clampedQuartz)
     }
     
-    // MARK: - Vision OCR & Paragraph Clustering
+    // MARK: - Vision OCR & Column-Aware Paragraph Clustering
     
     nonisolated func performOCR(on cgImage: CGImage) async throws -> [TextItem] {
         try await withCheckedThrowingContinuation { continuation in
@@ -702,7 +705,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let items: [TextItem] = observations.compactMap { obs in
                     guard let text = obs.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines),
                           !text.isEmpty else { return nil }
-                    return TextItem(text: text, boundingBox: obs.boundingBox)
+                    return TextItem(text: text, boundingBox: obs.boundingBox, avgLineHeight: obs.boundingBox.height)
                 }
                 continuation.resume(returning: items)
             }
@@ -719,9 +722,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     
+    /// Column-aware paragraph clustering so multi-column web pages stay strictly inline
     nonisolated func mergeIntoParagraphs(_ items: [TextItem]) -> [TextItem] {
         guard items.count > 1 else { return items }
         
+        // Sort top-to-bottom (maxY descending), then left-to-right (minX ascending)
         let sorted = items.sorted { a, b in
             let verticalDiff = a.boundingBox.maxY - b.boundingBox.maxY
             if abs(verticalDiff) > min(a.boundingBox.height, b.boundingBox.height) * 0.45 {
@@ -743,44 +748,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         for item in sorted {
             let box = item.boundingBox
-            guard var current = paragraphs.last else {
-                paragraphs.append(ParagraphAccumulator(
-                    text: item.text,
-                    unionBox: box,
-                    lastLineBox: box,
-                    firstLineMinX: box.minX,
-                    avgLineHeight: box.height,
-                    lineCount: 1
-                ))
-                continue
+            var mergedIndex: Int?
+            
+            // Search existing open paragraphs from bottom to top to find the matching column
+            for idx in paragraphs.indices.reversed() {
+                let candidate = paragraphs[idx]
+                
+                // 1. Same horizontal line split by small whitespace
+                let sameLineVerticalOverlap = min(candidate.lastLineBox.maxY, box.maxY) - max(candidate.lastLineBox.minY, box.minY)
+                let minH = min(candidate.lastLineBox.height, box.height)
+                let horizontalGap = box.minX - candidate.lastLineBox.maxX
+                if sameLineVerticalOverlap > minH * 0.55 && horizontalGap >= -0.01 && horizontalGap < candidate.avgLineHeight * 1.5 {
+                    mergedIndex = idx
+                    break
+                }
+                
+                // 2. Next line directly underneath in the same column
+                let verticalGap = candidate.lastLineBox.minY - box.maxY
+                if verticalGap > candidate.avgLineHeight * 1.15 {
+                    continue // Candidate paragraph is too far above
+                }
+                let isVerticallyClose = (verticalGap >= -candidate.avgLineHeight * 0.35 && verticalGap <= candidate.avgLineHeight * 0.75)
+                
+                let heightRatio = box.height / max(candidate.avgLineHeight, 0.0001)
+                let isSimilarFontSize = (heightRatio >= 0.72 && heightRatio <= 1.35)
+                
+                let leftEdgeDiff = min(abs(box.minX - candidate.lastLineBox.minX), abs(box.minX - candidate.firstLineMinX))
+                let overlapX = min(candidate.unionBox.maxX, box.maxX) - max(candidate.unionBox.minX, box.minX)
+                let minWidth = min(candidate.unionBox.width, box.width)
+                let isSameColumn = (leftEdgeDiff < 0.045) && (overlapX > minWidth * 0.50)
+                
+                let sentenceEndings: Set<Character> = [".", "!", "?", "。", "！", "？", ":", "："]
+                let endsWithPunctuation = candidate.text.last.map { sentenceEndings.contains($0) } ?? false
+                let isPreviousLineShortEnd = (candidate.lastLineBox.width < candidate.unionBox.width * 0.65) && endsWithPunctuation
+                
+                if isVerticallyClose && isSimilarFontSize && isSameColumn && !isPreviousLineShortEnd {
+                    mergedIndex = idx
+                    break
+                }
             }
             
-            let verticalGap = current.lastLineBox.minY - box.maxY
-            let maxAllowedGap = current.avgLineHeight * 0.90
-            let minAllowedGap = -current.avgLineHeight * 0.40
-            let isVerticallyClose = (verticalGap >= minAllowedGap && verticalGap <= maxAllowedGap)
-            
-            let heightRatio = box.height / max(current.avgLineHeight, 0.0001)
-            let isSimilarFontSize = (heightRatio >= 0.65 && heightRatio <= 1.45)
-            
-            let leftEdgeDiff = min(abs(box.minX - current.lastLineBox.minX), abs(box.minX - current.firstLineMinX))
-            let overlapX = min(current.unionBox.maxX, box.maxX) - max(current.unionBox.minX, box.minX)
-            let minWidth = min(current.unionBox.width, box.width)
-            let isHorizontallyAligned = (leftEdgeDiff < 0.08) && (overlapX > minWidth * 0.35)
-            
-            let sentenceEndings: Set<Character> = [".", "!", "?", "。", "！", "？", ":", "："]
-            let endsWithPunctuation = current.text.last.map { sentenceEndings.contains($0) } ?? false
-            let isPreviousLineShortEnd = (current.lineCount >= 1)
-                && (current.lastLineBox.width < current.unionBox.width * 0.68)
-                && endsWithPunctuation
-            
-            if isVerticallyClose && isSimilarFontSize && isHorizontallyAligned && !isPreviousLineShortEnd {
+            if let idx = mergedIndex {
+                var current = paragraphs[idx]
                 current.text = joinTextLines(current.text, item.text)
                 current.unionBox = current.unionBox.union(box)
                 current.lastLineBox = box
                 current.avgLineHeight = (current.avgLineHeight * CGFloat(current.lineCount) + box.height) / CGFloat(current.lineCount + 1)
                 current.lineCount += 1
-                paragraphs[paragraphs.count - 1] = current
+                paragraphs[idx] = current
             } else {
                 paragraphs.append(ParagraphAccumulator(
                     text: item.text,
@@ -793,7 +808,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         
-        return paragraphs.map { TextItem(text: $0.text, boundingBox: $0.unionBox) }
+        return paragraphs.map {
+            TextItem(text: $0.text, boundingBox: $0.unionBox, avgLineHeight: $0.avgLineHeight)
+        }
     }
     
     nonisolated private func joinTextLines(_ first: String, _ second: String) -> String {
@@ -818,11 +835,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     continuation.resume(throwing: error)
                     return
                 }
-                var words: [WordBox] = []
+                var rawWords: [WordBox] = []
                 let observations = request.results as? [VNRecognizedTextObservation] ?? []
                 for obs in observations {
                     guard let recognized = obs.topCandidates(1).first else { continue }
                     let full = recognized.string
+                    let totalCount = max(full.count, 1)
+                    let lineBox = obs.boundingBox
+                    
                     var searchStart = full.startIndex
                     while searchStart < full.endIndex {
                         while searchStart < full.endIndex && full[searchStart].isWhitespace {
@@ -835,13 +855,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         }
                         let range = searchStart..<wordEnd
                         let word = String(full[range])
-                        if let box = try? recognized.boundingBox(for: range) {
-                            words.append(WordBox(word: word, rect: box.boundingBox))
+                        
+                        // Use Vision character box if valid, otherwise fallback to proportional slice of lineBox
+                        if let box = try? recognized.boundingBox(for: range),
+                           box.boundingBox.width > 0.001, box.boundingBox.height > 0.001 {
+                            rawWords.append(WordBox(word: word, rect: box.boundingBox))
+                        } else {
+                            let startOffset = CGFloat(full.distance(from: full.startIndex, to: searchStart)) / CGFloat(totalCount)
+                            let endOffset = CGFloat(full.distance(from: full.startIndex, to: wordEnd)) / CGFloat(totalCount)
+                            let approxRect = CGRect(
+                                x: lineBox.origin.x + lineBox.width * startOffset,
+                                y: lineBox.origin.y,
+                                width: max(lineBox.width * (endOffset - startOffset), 0.01),
+                                height: lineBox.height
+                            )
+                            rawWords.append(WordBox(word: word, rect: approxRect))
                         }
                         searchStart = wordEnd
                     }
                 }
-                continuation.resume(returning: words)
+                
+                // Sort words in reading order (top-to-bottom, left-to-right)
+                let sortedWords = rawWords.sorted { a, b in
+                    let verticalDiff = a.rect.maxY - b.rect.maxY
+                    if abs(verticalDiff) > min(a.rect.height, b.rect.height) * 0.45 {
+                        return a.rect.maxY > b.rect.maxY
+                    }
+                    return a.rect.minX < b.rect.minX
+                }
+                continuation.resume(returning: sortedWords)
             }
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
@@ -874,7 +916,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         results.append(TranslatedBlock(
                             sourceText: items[idx].text,
                             translatedText: response.targetText,
-                            boundingBox: items[idx].boundingBox
+                            boundingBox: items[idx].boundingBox,
+                            avgLineHeight: items[idx].avgLineHeight
                         ))
                     }
                 }
@@ -883,7 +926,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         
         return items.map {
-            TranslatedBlock(sourceText: $0.text, translatedText: $0.text, boundingBox: $0.boundingBox)
+            TranslatedBlock(sourceText: $0.text, translatedText: $0.text, boundingBox: $0.boundingBox, avgLineHeight: $0.avgLineHeight)
         }
     }
     
@@ -944,12 +987,16 @@ actor HistoryLogger {
     }
 }
 
-// MARK: - Interactive Area Capture View (⌥⌘A)
+// MARK: - Interactive Area Capture View (⌥⌘A, Top-Left Flipped)
 
 class AreaCaptureView: NSView {
     var onSelectRect: ((CGRect?) -> Void)?
     private var startPoint: NSPoint?
     private var currentRect: CGRect?
+    
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .crosshair)
@@ -957,7 +1004,7 @@ class AreaCaptureView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.black.withAlphaComponent(0.22).setFill()
+        NSColor.black.withAlphaComponent(0.25).setFill()
         bounds.fill()
         
         if let rect = currentRect {
@@ -1001,16 +1048,17 @@ class AreaCaptureView: NSView {
             onSelectRect?(nil)
         }
     }
-    
-    override var acceptsFirstResponder: Bool { true }
 }
 
-// MARK: - Paragraph-Aware Glassmorphic Translation Overlay View
+// MARK: - Inline Screen-Scaling Translation Overlay View (Top-Left Flipped)
 
 class TranslationOverlayView: NSView {
     var blocks: [TranslatedBlock] = [] {
         didSet { needsDisplay = true }
     }
+    
+    // CRITICAL: Flip coordinate system to top-left so multiline text layout starts at the top-left of each block
+    override var isFlipped: Bool { true }
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -1018,22 +1066,28 @@ class TranslationOverlayView: NSView {
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .left
         paragraph.lineBreakMode = .byWordWrapping
-        paragraph.lineSpacing = 2.0
+        paragraph.lineSpacing = 1.5
         
         for block in blocks {
-            let rect = convertToView(block.boundingBox)
-            let coverRect = rect.insetBy(dx: -6, dy: -4)
+            let rect = convertVisionToFlippedView(block.boundingBox)
+            let originalLineHeightPts = max(block.avgLineHeight * bounds.height, 14.0)
+            let coverRect = rect.insetBy(dx: -4, dy: -2)
             
-            let path = NSBezierPath(roundedRect: coverRect, xRadius: 8, yRadius: 8)
-            NSColor(calibratedWhite: 0.08, alpha: 0.90).setFill()
+            let path = NSBezierPath(roundedRect: coverRect, xRadius: 6, yRadius: 6)
+            NSColor(calibratedWhite: 0.08, alpha: 0.92).setFill()
             path.fill()
             
-            NSColor.white.withAlphaComponent(0.20).setStroke()
+            NSColor.white.withAlphaComponent(0.22).setStroke()
             path.lineWidth = 1.0
             path.stroke()
             
-            let drawRect = coverRect.insetBy(dx: 6, dy: 4)
-            let fontSize = optimalFontSize(for: block.translatedText, in: drawRect.size, paragraphStyle: paragraph)
+            let drawRect = coverRect.insetBy(dx: 4, dy: 2)
+            let fontSize = optimalFontSize(
+                for: block.translatedText,
+                in: drawRect.size,
+                originalLineHeight: originalLineHeightPts,
+                paragraphStyle: paragraph
+            )
             
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
@@ -1046,9 +1100,15 @@ class TranslationOverlayView: NSView {
         }
     }
     
-    private func optimalFontSize(for text: String, in targetSize: NSSize, paragraphStyle: NSParagraphStyle) -> CGFloat {
-        let maxFont: CGFloat = 16.0
-        let minFont: CGFloat = 10.5
+    /// Dynamically scales font size based on the detected line height on the monitor
+    private func optimalFontSize(
+        for text: String,
+        in targetSize: NSSize,
+        originalLineHeight: CGFloat,
+        paragraphStyle: NSParagraphStyle
+    ) -> CGFloat {
+        let maxFont = min(max(originalLineHeight * 0.85, 13.0), 42.0)
+        let minFont: CGFloat = 9.5
         
         for size in stride(from: maxFont, through: minFont, by: -0.5) {
             let attrs: [NSAttributedString.Key: Any] = [
@@ -1056,7 +1116,7 @@ class TranslationOverlayView: NSView {
                 .paragraphStyle: paragraphStyle
             ]
             let bound = (text as NSString).boundingRect(
-                with: NSSize(width: max(targetSize.width, 40), height: .greatestFiniteMagnitude),
+                with: NSSize(width: max(targetSize.width, 32), height: .greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 attributes: attrs
             )
@@ -1067,16 +1127,16 @@ class TranslationOverlayView: NSView {
         return minFont
     }
     
-    private func convertToView(_ normalized: CGRect) -> CGRect {
+    private func convertVisionToFlippedView(_ normalized: CGRect) -> CGRect {
         let x = normalized.origin.x * bounds.width
-        let y = normalized.origin.y * bounds.height
+        let y = (1.0 - normalized.maxY) * bounds.height
         let w = normalized.size.width * bounds.width
         let h = normalized.size.height * bounds.height
-        return CGRect(x: x, y: y, width: max(w, 48), height: max(h, 22))
+        return CGRect(x: x, y: y, width: max(w, 28), height: max(h, 16))
     }
 }
 
-// MARK: - Word Selection View
+// MARK: - Word Selection & Rubber-Band Marquee Search View (⌥⌘S, Top-Left Flipped)
 
 class WordSelectionView: NSView {
     let words: [WordBox]
@@ -1084,90 +1144,209 @@ class WordSelectionView: NSView {
     var onCancel: (() -> Void)?
     
     private var selectedIndices: Set<Int> = []
-    private var anchorIndex: Int?
-    private var isDragging = false
+    private var hoveredIndex: Int?
+    private var dragStartPoint: NSPoint?
+    private var dragCurrentPoint: NSPoint?
+    private var anchorWordIndex: Int?
+    private var trackingArea: NSTrackingArea?
     
-    init(words: [WordBox], frame: NSRect = .zero) {
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    
+    init(words: [WordBox], frame: NSRect) {
         self.words = words
         super.init(frame: frame)
     }
     
     required init?(coder: NSCoder) { fatalError() }
     
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+    
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+    
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.black.withAlphaComponent(0.12).setFill()
+        NSColor.black.withAlphaComponent(0.18).setFill()
         bounds.fill()
         
+        // 1. Draw detected word boxes
         for (i, word) in words.enumerated() {
-            let rect = convertToView(word.rect).insetBy(dx: -2, dy: -1)
+            let rect = convertVisionToFlippedView(word.rect).insetBy(dx: -2, dy: -1)
             let path = NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
+            
             if selectedIndices.contains(i) {
-                NSColor.systemBlue.withAlphaComponent(0.55).setFill()
+                NSColor.systemBlue.withAlphaComponent(0.65).setFill()
                 path.fill()
+                NSColor.white.withAlphaComponent(0.8).setStroke()
+                path.lineWidth = 1.0
+                path.stroke()
+            } else if hoveredIndex == i {
+                NSColor.systemCyan.withAlphaComponent(0.35).setFill()
+                path.fill()
+                NSColor.systemCyan.setStroke()
+                path.lineWidth = 1.2
+                path.stroke()
             } else {
-                NSColor.white.withAlphaComponent(0.12).setStroke()
+                NSColor.white.withAlphaComponent(0.16).setStroke()
                 path.lineWidth = 0.8
                 path.stroke()
             }
         }
+        
+        // 2. Draw rubber-band selection rectangle if dragging
+        if let start = dragStartPoint, let current = dragCurrentPoint {
+            let marquee = CGRect(
+                x: min(start.x, current.x),
+                y: min(start.y, current.y),
+                width: abs(current.x - start.x),
+                height: abs(current.y - start.y)
+            )
+            if marquee.width > 4 || marquee.height > 4 {
+                NSColor.systemCyan.withAlphaComponent(0.15).setFill()
+                marquee.fill()
+                let border = NSBezierPath(roundedRect: marquee, xRadius: 4, yRadius: 4)
+                NSColor.systemCyan.setStroke()
+                border.lineWidth = 1.5
+                border.stroke()
+            }
+        }
+        
+        // 3. Draw top instruction & live selected text banner
+        let selectedText = selectedIndices.sorted().map { words[$0].word }.joined(separator: " ")
+        let bannerText = selectedText.isEmpty
+            ? "Click any word or drag a box across words to copy & Google Search (Press Esc to cancel)"
+            : "Search: \"\(selectedText)\""
+        
+        let bannerAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor.white
+        ]
+        let textSize = (bannerText as NSString).size(withAttributes: bannerAttrs)
+        let pillWidth = min(max(textSize.width + 32, 320), bounds.width - 40)
+        let pillRect = CGRect(x: (bounds.width - pillWidth) / 2, y: 36, width: pillWidth, height: 34)
+        
+        let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 17, yRadius: 17)
+        NSColor(calibratedWhite: 0.1, alpha: 0.90).setFill()
+        pillPath.fill()
+        NSColor.white.withAlphaComponent(0.25).setStroke()
+        pillPath.stroke()
+        
+        let textRect = CGRect(
+            x: pillRect.origin.x + 16,
+            y: pillRect.origin.y + (pillRect.height - textSize.height) / 2,
+            width: pillRect.width - 32,
+            height: textSize.height
+        )
+        (bannerText as NSString).draw(in: textRect, withAttributes: bannerAttrs)
     }
     
-    private func convertToView(_ normalized: CGRect) -> CGRect {
+    private func convertVisionToFlippedView(_ normalized: CGRect) -> CGRect {
         let x = normalized.origin.x * bounds.width
-        let y = normalized.origin.y * bounds.height
+        let y = (1.0 - normalized.maxY) * bounds.height
         let w = normalized.size.width * bounds.width
         let h = normalized.size.height * bounds.height
-        return CGRect(x: x, y: y, width: max(w, 16), height: max(h, 14))
+        return CGRect(x: x, y: y, width: max(w, 14), height: max(h, 12))
     }
     
     private func indexOfWord(at point: NSPoint) -> Int? {
         for (i, word) in words.enumerated() {
-            if convertToView(word.rect).insetBy(dx: -4, dy: -2).contains(point) {
+            if convertVisionToFlippedView(word.rect).insetBy(dx: -5, dy: -3).contains(point) {
                 return i
             }
         }
         return nil
     }
     
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let newHover = indexOfWord(at: point)
+        if newHover != hoveredIndex {
+            hoveredIndex = newHover
+            needsDisplay = true
+        }
+    }
+    
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        dragStartPoint = point
+        dragCurrentPoint = point
+        
         if let idx = indexOfWord(at: point) {
-            anchorIndex = idx
+            anchorWordIndex = idx
             selectedIndices = [idx]
-            isDragging = true
-            needsDisplay = true
+        } else {
+            anchorWordIndex = nil
+            selectedIndices.removeAll()
+        }
+        needsDisplay = true
+    }
+    
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = dragStartPoint else { return }
+        let current = convert(event.locationInWindow, from: nil)
+        dragCurrentPoint = current
+        
+        let marquee = CGRect(
+            x: min(start.x, current.x),
+            y: min(start.y, current.y),
+            width: max(abs(current.x - start.x), 2),
+            height: max(abs(current.y - start.y), 2)
+        )
+        
+        // Select all words intersecting the rubber-band marquee box
+        var boxMatches: Set<Int> = []
+        for (i, word) in words.enumerated() {
+            if convertVisionToFlippedView(word.rect).insetBy(dx: -2, dy: -2).intersects(marquee) {
+                boxMatches.insert(i)
+            }
+        }
+        
+        // Also support range selection if user started on a word and dragged onto another word
+        if let anchor = anchorWordIndex, let currentIdx = indexOfWord(at: current) {
+            let low = min(anchor, currentIdx)
+            let high = max(anchor, currentIdx)
+            boxMatches.formUnion(low...high)
+        }
+        
+        selectedIndices = boxMatches
+        needsDisplay = true
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        let sorted = selectedIndices.sorted()
+        let text = sorted.map { words[$0].word }.joined(separator: " ")
+        
+        dragStartPoint = nil
+        dragCurrentPoint = nil
+        
+        if !text.isEmpty {
+            onComplete?(text)
         } else {
             onCancel?()
         }
     }
     
-    override func mouseDragged(with event: NSEvent) {
-        guard isDragging, let anchor = anchorIndex else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        if let current = indexOfWord(at: point) {
-            let low = min(anchor, current)
-            let high = max(anchor, current)
-            selectedIndices = Set(low...high)
-            needsDisplay = true
-        }
-    }
-    
-    override func mouseUp(with event: NSEvent) {
-        guard isDragging else { return }
-        isDragging = false
-        let sorted = selectedIndices.sorted()
-        let text = sorted.map { words[$0].word }.joined(separator: " ")
-        onComplete?(text.isEmpty ? nil : text)
-    }
-    
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
+        if event.keyCode == 53 { // Escape
             onCancel?()
         }
     }
-    
-    override var acceptsFirstResponder: Bool { true }
 }
 
 // MARK: - Single-Instance Menu Bar App Entry
@@ -1175,7 +1354,6 @@ class WordSelectionView: NSView {
 let bundleID = Bundle.main.bundleIdentifier ?? "com.screenlens.app"
 let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
 if runningApps.count > 1 {
-    // 防止重复双击启动多个状态栏图标
     exit(0)
 }
 
