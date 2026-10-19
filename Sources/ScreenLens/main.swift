@@ -303,9 +303,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     
     // MARK: - Coordinate Conversion (Quartz Top-Left <-> AppKit Bottom-Left)
     
+    func screenContaining(_ rect: CGRect) -> NSScreen {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        return NSScreen.screens.first { $0.frame.contains(center) } ?? NSScreen.main ?? NSScreen.screens.first!
+    }
+    
     func quartzToAppKit(_ quartzRect: CGRect) -> CGRect {
-        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? NSScreen.main?.frame.height ?? 1080
-        let appKitY = primaryScreenHeight - quartzRect.origin.y - quartzRect.height
+        // Quartz is top-left of primary; AppKit is bottom-left of primary.
+        // Use the screen that actually contains the rect so external displays work.
+        let screen = screenContaining(quartzRect)
+        let screenTop = screen.frame.maxY
+        let appKitY = screenTop - quartzRect.origin.y - quartzRect.height
         return CGRect(
             x: quartzRect.origin.x,
             y: appKitY,
@@ -315,8 +323,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     
     func appKitToQuartz(_ appKitRect: CGRect) -> CGRect {
-        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? NSScreen.main?.frame.height ?? 1080
-        let quartzY = primaryScreenHeight - appKitRect.maxY
+        let screen = screenContaining(appKitRect)
+        let screenTop = screen.frame.maxY
+        let quartzY = screenTop - appKitRect.maxY
         return CGRect(
             x: appKitRect.origin.x,
             y: quartzY,
@@ -530,7 +539,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.isReleasedWhenClosed = false
         window.setFrame(screenFrame, display: true)
         
-        let view = WordSelectionView(words: words)
+        let view = WordSelectionView(words: words, frame: NSRect(origin: .zero, size: screenFrame.size))
         view.onComplete = { [weak self, weak window] selectedText in
             Task { @MainActor in
                 window?.orderOut(nil)
@@ -550,6 +559,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         window.contentView = view
         window.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKey()
         window.makeFirstResponder(view)
         selectionWindow = window
@@ -1077,9 +1087,9 @@ class WordSelectionView: NSView {
     private var anchorIndex: Int?
     private var isDragging = false
     
-    init(words: [WordBox]) {
+    init(words: [WordBox], frame: NSRect = .zero) {
         self.words = words
-        super.init(frame: .zero)
+        super.init(frame: frame)
     }
     
     required init?(coder: NSCoder) { fatalError() }
