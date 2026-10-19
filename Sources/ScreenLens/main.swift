@@ -783,9 +783,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     nonisolated func mergeIntoParagraphs(_ items: [TextItem]) -> [TextItem] {
         guard items.count > 1 else { return items }
         
+        // Sort top-to-bottom, then left-to-right
         let sorted = items.sorted { a, b in
             let verticalDiff = a.boundingBox.maxY - b.boundingBox.maxY
-            if abs(verticalDiff) > min(a.boundingBox.height, b.boundingBox.height) * 0.45 {
+            if abs(verticalDiff) > min(a.boundingBox.height, b.boundingBox.height) * 0.4 {
                 return a.boundingBox.maxY > b.boundingBox.maxY
             }
             return a.boundingBox.minX < b.boundingBox.minX
@@ -806,36 +807,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let box = item.boundingBox
             var mergedIndex: Int?
             
+            // Only consider the most recent paragraph that is still close
             for idx in paragraphs.indices.reversed() {
                 let candidate = paragraphs[idx]
                 
+                // Same-line continuation (text wrapped horizontally)
                 let sameLineVerticalOverlap = min(candidate.lastLineBox.maxY, box.maxY) - max(candidate.lastLineBox.minY, box.minY)
                 let minH = min(candidate.lastLineBox.height, box.height)
                 let horizontalGap = box.minX - candidate.lastLineBox.maxX
-                if sameLineVerticalOverlap > minH * 0.55 && horizontalGap >= -0.01 && horizontalGap < candidate.avgLineHeight * 1.5 {
+                if sameLineVerticalOverlap > minH * 0.4 && horizontalGap >= -0.02 && horizontalGap < candidate.avgLineHeight * 2.5 {
                     mergedIndex = idx
                     break
                 }
                 
+                // Vertical gap between this line and the last line of the candidate
                 let verticalGap = candidate.lastLineBox.minY - box.maxY
-                if verticalGap > candidate.avgLineHeight * 1.15 {
+                
+                // Large gap = definite paragraph break
+                if verticalGap > candidate.avgLineHeight * 1.8 {
                     continue
                 }
-                let isVerticallyClose = (verticalGap >= -candidate.avgLineHeight * 0.35 && verticalGap <= candidate.avgLineHeight * 0.75)
+                
+                // Keep lines together if they are reasonably close and in the same column
+                let isVerticallyClose = verticalGap >= -candidate.avgLineHeight * 0.5 && verticalGap <= candidate.avgLineHeight * 1.4
                 
                 let heightRatio = box.height / max(candidate.avgLineHeight, 0.0001)
-                let isSimilarFontSize = (heightRatio >= 0.72 && heightRatio <= 1.35)
+                let isSimilarFontSize = heightRatio >= 0.6 && heightRatio <= 1.6
                 
+                // Same column: left edges close OR substantial horizontal overlap
                 let leftEdgeDiff = min(abs(box.minX - candidate.lastLineBox.minX), abs(box.minX - candidate.firstLineMinX))
                 let overlapX = min(candidate.unionBox.maxX, box.maxX) - max(candidate.unionBox.minX, box.minX)
                 let minWidth = min(candidate.unionBox.width, box.width)
-                let isSameColumn = (leftEdgeDiff < 0.045) && (overlapX > minWidth * 0.50)
+                let isSameColumn = leftEdgeDiff < 0.12 || overlapX > minWidth * 0.35
                 
-                let sentenceEndings: Set<Character> = [".", "!", "?", "。", "！", "？", ":", "："]
+                // Only force a break on a clear sentence end + short line + larger gap
+                let sentenceEndings: Set<Character> = [".", "!", "?", "。", "！", "？"]
                 let endsWithPunctuation = candidate.text.last.map { sentenceEndings.contains($0) } ?? false
-                let isPreviousLineShortEnd = (candidate.lastLineBox.width < candidate.unionBox.width * 0.65) && endsWithPunctuation
+                let isClearParagraphEnd = endsWithPunctuation
+                    && candidate.lastLineBox.width < candidate.unionBox.width * 0.55
+                    && verticalGap > candidate.avgLineHeight * 0.6
                 
-                if isVerticallyClose && isSimilarFontSize && isSameColumn && !isPreviousLineShortEnd {
+                if isVerticallyClose && isSimilarFontSize && isSameColumn && !isClearParagraphEnd {
                     mergedIndex = idx
                     break
                 }
