@@ -118,7 +118,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         print("Translate triggered")
         
         guard let region = locateActiveTextRegion() else {
-            showAlert("Could not find an active text area. Grant Accessibility permission and focus a window with text.")
+            showAlert("Could not find an active window. Grant Accessibility permission and focus a window.")
             return
         }
         
@@ -317,18 +317,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
         
-        // Prefer the focused UI element (text field, editor, web content)
-        var targetElement: AnyObject?
-        if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &targetElement) != .success {
-            AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &targetElement)
+        // Always prefer the focused window (more reliable for browsers like Brave)
+        var windowElement: AnyObject?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowElement) == .success,
+              let window = windowElement as! AXUIElement? else {
+            return nil
         }
-        
-        guard let element = targetElement as! AXUIElement? else { return nil }
         
         var posValue: AnyObject?
         var sizeValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posValue) == .success,
-              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posValue) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue) == .success else {
             return nil
         }
         
@@ -339,12 +338,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         var raw = CGRect(origin: point, size: size)
         
-        // If the focused element is a whole large window, inset to the content area
-        if raw.width > 700 && raw.height > 500 {
-            raw = raw.insetBy(dx: raw.width * 0.12, dy: raw.height * 0.10)
+        // Inset to skip title bar / toolbar and focus on content
+        // Larger inset at the top to avoid the ~3-line offset from chrome
+        if raw.width > 400 && raw.height > 300 {
+            raw = CGRect(
+                x: raw.origin.x + raw.width * 0.04,
+                y: raw.origin.y + raw.height * 0.06,
+                width: raw.width * 0.92,
+                height: raw.height * 0.86
+            )
         }
         
-        // Reject tiny or invalid regions
         guard raw.width > 80, raw.height > 40 else { return nil }
         return raw
     }
@@ -518,7 +522,7 @@ actor HistoryLogger {
         if let data = entry.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: markdownFileURL.path),
                let handle = try? FileHandle(forWritingTo: markdownFileURL) {
-                try? handle.seekToEnd()
+                _ = try? handle.seekToEnd()
                 try? handle.write(contentsOf: data)
                 try? handle.close()
             } else {
@@ -558,6 +562,8 @@ class TranslationOverlayView: NSView {
         }
     }
     
+    // Vision uses bottom-left origin; NSView is also bottom-left, so no Y flip.
+    // Previous 3-line upward offset was from window chrome; region inset above fixes it.
     private func convertToView(_ normalized: CGRect) -> CGRect {
         let x = normalized.origin.x * bounds.width
         let y = normalized.origin.y * bounds.height
