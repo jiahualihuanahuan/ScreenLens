@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "ScreenLens",
     platforms: [
-        .macOS(.v15)
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "ScreenLens", targets: ["ScreenLens"])
