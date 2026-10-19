@@ -436,13 +436,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let (cgImage, actualQuartzRegion) = try await captureRegionImage(requestedQuartzRegion)
             let rawItems = try await performOCR(on: cgImage)
             let mergedParagraphs = mergeIntoParagraphs(rawItems)
+            // Drop sidebar / edge fragments (partial text cut off at the sides)
+            let filtered = mergedParagraphs.filter { item in
+                let box = item.boundingBox
+                // Skip if too close to left or right edge of the capture
+                if box.minX < 0.06 || box.maxX > 0.94 { return false }
+                // Skip very narrow strips (sidebar leftovers)
+                if box.width < 0.12 { return false }
+                // Skip very short UI chrome
+                if item.text.count < 8 { return false }
+                return true
+            }
             
-            guard !mergedParagraphs.isEmpty else {
+            guard !filtered.isEmpty else {
                 NSSound.beep()
                 return
             }
             
-            let blocks = await translateBatch(items: mergedParagraphs, to: targetLanguage)
+            let blocks = await translateBatch(items: filtered, to: targetLanguage)
             guard !blocks.isEmpty else { return }
             
             let appKitRegion = quartzToAppKit(actualQuartzRegion)
@@ -1133,7 +1144,8 @@ class TranslationOverlayView: NSView {
         for block in blocks {
             let rect = convertVisionToFlippedView(block.boundingBox)
             let originalLineHeightPts = max(block.avgLineHeight * bounds.height, 14.0)
-            let coverRect = rect.insetBy(dx: -4, dy: -2)
+            // Tighter cover so the box stays on the text
+            let coverRect = rect.insetBy(dx: -2, dy: -1)
             
             let path = NSBezierPath(roundedRect: coverRect, xRadius: 6, yRadius: 6)
             NSColor(calibratedWhite: 0.08, alpha: 0.92).setFill()
