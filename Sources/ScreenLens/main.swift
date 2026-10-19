@@ -117,7 +117,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dismissTranslation()
         print("Translate triggered")
         
-        if !checkAccessibility() {
+        if !AXIsProcessTrusted() {
             showAlert("Accessibility permission is required. Enable ScreenLens (or Terminal) in System Settings → Privacy & Security → Accessibility, then try again.")
             return
         }
@@ -160,13 +160,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
         }
-    }
-    
-    nonisolated func checkAccessibility() -> Bool {
-        if AXIsProcessTrusted() { return true }
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        AXIsProcessTrustedWithOptions(opts)
-        return false
     }
     
     func showTranslationOverlay(blocks: [TranslatedBlock], region: CGRect) {
