@@ -436,15 +436,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let (cgImage, actualQuartzRegion) = try await captureRegionImage(requestedQuartzRegion)
             let rawItems = try await performOCR(on: cgImage)
             let mergedParagraphs = mergeIntoParagraphs(rawItems)
-            // Drop sidebar / edge fragments (partial text cut off at the sides)
+            // Only keep text well inside the capture (main content, not sidebar/edge)
             let filtered = mergedParagraphs.filter { item in
                 let box = item.boundingBox
-                // Skip if too close to left or right edge of the capture
-                if box.minX < 0.06 || box.maxX > 0.94 { return false }
-                // Skip very narrow strips (sidebar leftovers)
-                if box.width < 0.12 { return false }
-                // Skip very short UI chrome
-                if item.text.count < 8 { return false }
+                // Must be clearly inside the region
+                if box.minX < 0.10 || box.maxX > 0.90 { return false }
+                // Skip narrow sidebar strips
+                if box.width < 0.18 { return false }
+                // Skip tiny UI labels
+                if item.text.count < 12 { return false }
                 return true
             }
             
@@ -1143,9 +1143,9 @@ class TranslationOverlayView: NSView {
         
         for block in blocks {
             let rect = convertVisionToFlippedView(block.boundingBox)
-            let originalLineHeightPts = max(block.avgLineHeight * bounds.height, 14.0)
-            // Tighter cover so the box stays on the text
-            let coverRect = rect.insetBy(dx: -2, dy: -1)
+            let originalLineHeightPts = max(block.avgLineHeight * bounds.height, 12.0)
+            // Exact bounds — no expansion so the box stays on the original text
+            let coverRect = rect
             
             let path = NSBezierPath(roundedRect: coverRect, xRadius: 6, yRadius: 6)
             NSColor(calibratedWhite: 0.08, alpha: 0.92).setFill()
@@ -1180,8 +1180,8 @@ class TranslationOverlayView: NSView {
         originalLineHeight: CGFloat,
         paragraphStyle: NSParagraphStyle
     ) -> CGFloat {
-        let maxFont = min(max(originalLineHeight * 0.85, 13.0), 42.0)
-        let minFont: CGFloat = 9.5
+        let maxFont = min(max(originalLineHeight * 0.95, 11.0), 36.0)
+        let minFont: CGFloat = 9.0
         
         for size in stride(from: maxFont, through: minFont, by: -0.5) {
             let attrs: [NSAttributedString.Key: Any] = [
