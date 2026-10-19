@@ -117,8 +117,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dismissTranslation()
         print("Translate triggered")
         
+        // Check and prompt for Accessibility if needed
+        if !AXIsProcessTrusted() {
+            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            AXIsProcessTrustedWithOptions(opts)
+            showAlert("Accessibility permission is required. Enable ScreenLens (or Terminal) in System Settings → Privacy & Security → Accessibility, then try again.")
+            return
+        }
+        
         guard let region = locateActiveTextRegion() else {
-            showAlert("Could not find an active window. Grant Accessibility permission and focus a window.")
+            showAlert("Could not find an active window. Make sure a window is focused and Accessibility is enabled for this app.")
             return
         }
         
@@ -312,22 +320,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     nonisolated func locateActiveTextRegion() -> CGRect? {
         let systemWide = AXUIElementCreateSystemWide()
         var focusedApp: AnyObject?
-        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success,
-              let appElement = focusedApp as! AXUIElement? else {
+        let appResult = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp)
+        print("AX focused app result: \(appResult.rawValue)")
+        guard appResult == .success, let appElement = focusedApp as! AXUIElement? else {
+            print("Failed to get focused application")
             return nil
         }
         
-        // Always prefer the focused window (more reliable for browsers like Brave)
         var windowElement: AnyObject?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowElement) == .success,
-              let window = windowElement as! AXUIElement? else {
+        let winResult = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowElement)
+        print("AX focused window result: \(winResult.rawValue)")
+        guard winResult == .success, let window = windowElement as! AXUIElement? else {
+            print("Failed to get focused window")
             return nil
         }
         
         var posValue: AnyObject?
         var sizeValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posValue) == .success,
-              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+        let posResult = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posValue)
+        let sizeResult = AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue)
+        print("AX position result: \(posResult.rawValue), size result: \(sizeResult.rawValue)")
+        guard posResult == .success, sizeResult == .success else {
+            print("Failed to get window position/size")
             return nil
         }
         
@@ -337,9 +351,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
         
         var raw = CGRect(origin: point, size: size)
+        print("Raw window rect: \(raw)")
         
-        // Inset to skip title bar / toolbar and focus on content
-        // Larger inset at the top to avoid the ~3-line offset from chrome
         if raw.width > 400 && raw.height > 300 {
             raw = CGRect(
                 x: raw.origin.x + raw.width * 0.04,
@@ -349,7 +362,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         
-        guard raw.width > 80, raw.height > 40 else { return nil }
+        guard raw.width > 80, raw.height > 40 else {
+            print("Region too small: \(raw)")
+            return nil
+        }
         return raw
     }
     
@@ -562,8 +578,6 @@ class TranslationOverlayView: NSView {
         }
     }
     
-    // Vision uses bottom-left origin; NSView is also bottom-left, so no Y flip.
-    // Previous 3-line upward offset was from window chrome; region inset above fixes it.
     private func convertToView(_ normalized: CGRect) -> CGRect {
         let x = normalized.origin.x * bounds.width
         let y = normalized.origin.y * bounds.height
