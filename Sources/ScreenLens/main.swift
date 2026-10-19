@@ -445,6 +445,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if box.width < 0.18 { return false }
                 // Skip tiny UI labels
                 if item.text.count < 12 { return false }
+                // Skip very large text (headlines / banners)
+                if box.height > 0.08 { return false }
                 return true
             }
             
@@ -1143,7 +1145,7 @@ class TranslationOverlayView: NSView {
         
         for block in blocks {
             let rect = convertVisionToFlippedView(block.boundingBox)
-            let originalLineHeightPts = max(block.avgLineHeight * bounds.height, 12.0)
+            let originalLineHeightPts = max(block.avgLineHeight * bounds.height, 9.0)
             // Exact bounds — no expansion so the box stays on the original text
             let coverRect = rect
             
@@ -1180,8 +1182,8 @@ class TranslationOverlayView: NSView {
         originalLineHeight: CGFloat,
         paragraphStyle: NSParagraphStyle
     ) -> CGFloat {
-        let maxFont = min(max(originalLineHeight * 0.95, 11.0), 36.0)
-        let minFont: CGFloat = 9.0
+        let maxFont = min(max(originalLineHeight * 0.95, 9.0), 22.0)
+        let minFont: CGFloat = 7.5
         
         for size in stride(from: maxFont, through: minFont, by: -0.5) {
             let attrs: [NSAttributedString.Key: Any] = [
