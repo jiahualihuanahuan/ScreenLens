@@ -436,15 +436,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let (cgImage, actualQuartzRegion) = try await captureRegionImage(requestedQuartzRegion)
             let rawItems = try await performOCR(on: cgImage)
             let mergedParagraphs = mergeIntoParagraphs(rawItems)
-            // Only keep text well inside the capture (main content, not sidebar/edge)
+            // Prefer middle content; only drop extreme edges and tiny fragments
             let filtered = mergedParagraphs.filter { item in
                 let box = item.boundingBox
-                // Must be clearly inside the region
-                if box.minX < 0.10 || box.maxX > 0.90 { return false }
-                // Skip narrow sidebar strips
-                if box.width < 0.18 { return false }
-                // Skip tiny UI labels
-                if item.text.count < 6 { return false }
+                // Drop only extreme left/right edges
+                if box.minX < 0.03 || box.maxX > 0.97 { return false }
+                // Drop very narrow sidebar strips
+                if box.width < 0.08 { return false }
+                // Keep short but meaningful text
+                if item.text.count < 4 { return false }
                 return true
             }
             
@@ -456,8 +456,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let blocks = await translateBatch(items: filtered, to: targetLanguage)
             guard !blocks.isEmpty else { return }
             
+            // Sort so blocks closer to the center are drawn last (appear on top when overlapping)
+            let sortedBlocks = blocks.sorted { a, b in
+                let aCenter = abs(a.boundingBox.midX - 0.5) + abs(a.boundingBox.midY - 0.5)
+                let bCenter = abs(b.boundingBox.midX - 0.5) + abs(b.boundingBox.midY - 0.5)
+                return aCenter > bCenter  // farther from center drawn first
+            }
+            
             let appKitRegion = quartzToAppKit(actualQuartzRegion)
-            showTranslationOverlay(blocks: blocks, appKitRegion: appKitRegion)
+            showTranslationOverlay(blocks: sortedBlocks, appKitRegion: appKitRegion)
             startInputMonitoring()
             
             let combinedSrc = blocks.map(\.sourceText).joined(separator: "\n")
@@ -1205,7 +1212,7 @@ class TranslationOverlayView: NSView {
         let y = (1.0 - normalized.maxY) * bounds.height
         let w = normalized.size.width * bounds.width
         let h = normalized.size.height * bounds.height
-        return CGRect(x: x, y: y, width: max(w, 28), height: max(h, 16))
+        return CGRect(x: x, y: y, width: max(w, 16), height: max(h, 10))
     }
 }
 
