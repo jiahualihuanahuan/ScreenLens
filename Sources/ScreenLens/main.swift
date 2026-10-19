@@ -10,7 +10,7 @@ import Foundation
 
 struct TextItem: Sendable {
     let text: String
-    let boundingBox: CGRect // Vision 归一化坐标 (原点在左下角, 0.0 ~ 1.0)
+    let boundingBox: CGRect
 }
 
 struct WordBox: Sendable {
@@ -56,7 +56,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupMenu()
         setupHotKeys()
-        print("ScreenLens running. Hotkeys: ⌥⌘T translate active area, ⌥⌘S word-select search")
+        print("ScreenLens v2 running (Brave/Chromium + Paragraph Merge enabled).")
+        print("Hotkeys: ⌥⌘T translate active area, ⌥⌘S word-select search")
     }
     
     func setupMenu() {
@@ -140,6 +141,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dismissTranslation()
         print("Translate triggered")
         
+        // Swift 6 并发安全写法：直接使用字符串 Key 避免引用 C 可变全局变量 kAXTrustedCheckOptionPrompt
+        if !AXIsProcessTrusted() {
+            let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+        }
+        
         guard let quartzRegion = locateActiveTextRegion() else {
             showAlert("Could not find an active window. Please make sure a window is visible on screen.")
             return
@@ -151,7 +158,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let cgImage = try await captureRegionImage(quartzRegion)
             let rawItems = try await performOCR(on: cgImage)
             
-            // 将多行碎片化的 OCR 结果自动聚类合并为自然段
             let mergedParagraphs = mergeIntoParagraphs(rawItems)
             print("OCR lines: \(rawItems.count) -> Merged paragraphs: \(mergedParagraphs.count)")
             
@@ -321,7 +327,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // MARK: - Robust Region Locator (Supports Brave, Chrome, Electron & Native Apps)
+    // MARK: - Robust Region Locator (Brave / Chrome / Electron + WindowServer Fallback)
     
     func locateActiveTextRegion() -> CGRect? {
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -330,11 +336,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         var rawRect: CGRect?
         
-        // 1. 尝试通过 AXUIElement 获取窗口 (针对 Brave/Chrome 显式开启 AXManualAccessibility)
+        // 1. 尝试通过 AXUIElement 获取窗口，并显式唤醒 Chromium 辅助功能树
         if let pid = targetPID, pid != ownPID, AXIsProcessTrusted() {
             let appElement = AXUIElementCreateApplication(pid)
-            // 唤醒 Chromium / Electron 内核的 Accessibility 支持
-            AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, true as CFBoolean)
             
             var windowObj: AnyObject?
             if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowObj) != .success {
@@ -365,22 +370,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         
-        // 2. 兜底方案：若 Brave/Chrome 尚未就绪或未授权 AX，直接通过 CGWindowListCopyWindowInfo 从窗口服务器读取
+        // 2. 兜底方案：若 Brave/Chrome 拒绝 AX 查询，直接从 WindowServer 读取最前端窗口坐标
         if rawRect == nil {
             let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
             if let windowInfoList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
                 for info in windowInfoList {
-                    guard let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
+                    guard let ownerPID = info["kCGWindowOwnerPID"] as? pid_t,
                           ownerPID != ownPID,
-                          let layer = info[kCGWindowLayer as String] as? Int,
-                          layer == 0, // 仅匹配标准应用主窗口层级
-                          let boundsDict = info[kCGWindowBounds as String] as? [String: CGFloat],
+                          let layer = info["kCGWindowLayer"] as? Int,
+                          layer == 0,
+                          let boundsDict = info["kCGWindowBounds"] as? [String: CGFloat],
                           let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
                           rect.width > 120, rect.height > 80 else {
                         continue
                     }
                     
-                    // 若存在明确的 frontmostApp，优先匹配该 PID 的最顶层窗口
                     if let targetPID = targetPID, ownerPID != targetPID {
                         continue
                     }
@@ -394,7 +398,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         guard var finalRect = rawRect else { return nil }
         
-        // 裁剪掉顶部浏览器标签栏/地址栏（约 82pt）与四周边缘，聚焦核心阅读区
         if finalRect.width > 400 && finalRect.height > 300 {
             let topInset = min(max(finalRect.height * 0.08, 72), 96)
             let bottomInset = finalRect.height * 0.03
@@ -439,7 +442,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
     }
     
-    // MARK: - Vision OCR & Paragraph Merging Algorithm
+    // MARK: - Vision OCR & Paragraph Clustering
     
     nonisolated func performOCR(on cgImage: CGImage) async throws -> [TextItem] {
         try await withCheckedThrowingContinuation { continuation in
@@ -469,17 +472,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    /// 将多行碎片化的单行 TextItem 聚类合并为完整自然段
     nonisolated func mergeIntoParagraphs(_ items: [TextItem]) -> [TextItem] {
         guard items.count > 1 else { return items }
         
-        // Vision 坐标系原点在左下角：maxY 越大越靠上
         let sorted = items.sorted { a, b in
             let verticalDiff = a.boundingBox.maxY - b.boundingBox.maxY
             if abs(verticalDiff) > min(a.boundingBox.height, b.boundingBox.height) * 0.45 {
-                return a.boundingBox.maxY > b.boundingBox.maxY // 从上到下
+                return a.boundingBox.maxY > b.boundingBox.maxY
             }
-            return a.boundingBox.minX < b.boundingBox.minX // 同行从左到右
+            return a.boundingBox.minX < b.boundingBox.minX
         }
         
         struct ParagraphAccumulator {
@@ -507,23 +508,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 continue
             }
             
-            // 1. 计算垂直间距 (上一行底部 minY 到当前行顶部 maxY)
             let verticalGap = current.lastLineBox.minY - box.maxY
             let maxAllowedGap = current.avgLineHeight * 0.90
             let minAllowedGap = -current.avgLineHeight * 0.40
             let isVerticallyClose = (verticalGap >= minAllowedGap && verticalGap <= maxAllowedGap)
             
-            // 2. 校验字号/行高一致性 (避免标题与正文合并)
             let heightRatio = box.height / max(current.avgLineHeight, 0.0001)
             let isSimilarFontSize = (heightRatio >= 0.65 && heightRatio <= 1.45)
             
-            // 3. 校验水平同栏对齐 (左边距相近，且水平投影有重叠)
             let leftEdgeDiff = min(abs(box.minX - current.lastLineBox.minX), abs(box.minX - current.firstLineMinX))
             let overlapX = min(current.unionBox.maxX, box.maxX) - max(current.unionBox.minX, box.minX)
             let minWidth = min(current.unionBox.width, box.width)
             let isHorizontallyAligned = (leftEdgeDiff < 0.08) && (overlapX > minWidth * 0.35)
             
-            // 4. 检测上一行是否已经是自然段结尾 (行宽明显缩短且以句末标点结尾)
             let sentenceEndings: Set<Character> = [".", "!", "?", "。", "！", "？", ":", "："]
             let endsWithPunctuation = current.text.last.map { sentenceEndings.contains($0) } ?? false
             let isPreviousLineShortEnd = (current.lineCount >= 1)
@@ -531,7 +528,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 && endsWithPunctuation
             
             if isVerticallyClose && isSimilarFontSize && isHorizontallyAligned && !isPreviousLineShortEnd {
-                // 合并进当前自然段
                 current.text = joinTextLines(current.text, item.text)
                 current.unionBox = current.unionBox.union(box)
                 current.lastLineBox = box
@@ -539,7 +535,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 current.lineCount += 1
                 paragraphs[paragraphs.count - 1] = current
             } else {
-                // 开启新自然段
                 paragraphs.append(ParagraphAccumulator(
                     text: item.text,
                     unionBox: box,
@@ -554,7 +549,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return paragraphs.map { TextItem(text: $0.text, boundingBox: $0.unionBox) }
     }
     
-    /// 智能拼接上下两行文本（自动处理英文连字符与中英文空格）
     nonisolated private func joinTextLines(_ first: String, _ second: String) -> String {
         if first.hasSuffix("-") && first.count > 1 {
             return String(first.dropLast()) + second
@@ -603,3 +597,272 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 continuation.resume(returning: words)
             }
             request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            request.automaticallyDetectsLanguage = true
+            
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+    
+    // MARK: - Batch Translation
+    
+    nonisolated func translateBatch(items: [TextItem], to target: String) async -> [TranslatedBlock] {
+        let source = Locale.Language(identifier: "en")
+        let targetLang = Locale.Language(identifier: target)
+        
+        if #available(macOS 26.0, *) {
+            let session = TranslationSession(installedSource: source, target: targetLang)
+            let requests = items.enumerated().map { idx, item in
+                TranslationSession.Request(sourceText: item.text, clientIdentifier: "\(idx)")
+            }
+            if let responses = try? await session.translations(from: requests) {
+                var results: [TranslatedBlock] = []
+                for response in responses {
+                    if let idStr = response.clientIdentifier, let idx = Int(idStr), idx < items.count {
+                        results.append(TranslatedBlock(
+                            sourceText: items[idx].text,
+                            translatedText: response.targetText,
+                            boundingBox: items[idx].boundingBox
+                        ))
+                    }
+                }
+                if !results.isEmpty { return results }
+            }
+        }
+        
+        return items.map {
+            TranslatedBlock(sourceText: $0.text, translatedText: $0.text, boundingBox: $0.boundingBox)
+        }
+    }
+    
+    func showAlert(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "ScreenLens"
+        alert.informativeText = message
+        alert.runModal()
+    }
+}
+
+// MARK: - History Logger
+
+actor HistoryLogger {
+    static let shared = HistoryLogger()
+    private let markdownFileURL: URL
+    private var lastHash: Int = 0
+    
+    init() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("ScreenLens", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        markdownFileURL = dir.appendingPathComponent("Translation_History.md")
+    }
+    
+    func record(blocks: [TranslatedBlock]) {
+        guard !blocks.isEmpty else { return }
+        let combinedSource = blocks.map(\.sourceText).joined(separator: "\n\n")
+        let combinedTarget = blocks.map(\.translatedText).joined(separator: "\n\n")
+        let hash = combinedSource.hashValue ^ combinedTarget.hashValue
+        guard hash != lastHash else { return }
+        lastHash = hash
+        
+        let now = ISO8601DateFormatter().string(from: Date())
+        let entry = """
+        
+        ## \(now)
+        **Source:**
+        > \(combinedSource.replacingOccurrences(of: "\n", with: "\n> "))
+        
+        **Translation:**
+        \(combinedTarget)
+        
+        ---
+        """
+        if let data = entry.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: markdownFileURL.path),
+               let handle = try? FileHandle(forWritingTo: markdownFileURL) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            } else {
+                try? data.write(to: markdownFileURL, options: .atomic)
+            }
+        }
+    }
+}
+
+// MARK: - Paragraph-Aware Glassmorphic Translation Overlay View
+
+class TranslationOverlayView: NSView {
+    var blocks: [TranslatedBlock] = [] {
+        didSet { needsDisplay = true }
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = 2.0
+        
+        for block in blocks {
+            let rect = convertToView(block.boundingBox)
+            let coverRect = rect.insetBy(dx: -6, dy: -4)
+            
+            let path = NSBezierPath(roundedRect: coverRect, xRadius: 8, yRadius: 8)
+            NSColor(calibratedWhite: 0.08, alpha: 0.90).setFill()
+            path.fill()
+            
+            NSColor.white.withAlphaComponent(0.20).setStroke()
+            path.lineWidth = 1.0
+            path.stroke()
+            
+            let drawRect = coverRect.insetBy(dx: 6, dy: 4)
+            let fontSize = optimalFontSize(for: block.translatedText, in: drawRect.size, paragraphStyle: paragraph)
+            
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph
+            ]
+            
+            let attrStr = NSAttributedString(string: block.translatedText, attributes: attrs)
+            attrStr.draw(with: drawRect, options: [.usesLineFragmentOrigin, .usesFontLeading])
+        }
+    }
+    
+    private func optimalFontSize(for text: String, in targetSize: NSSize, paragraphStyle: NSParagraphStyle) -> CGFloat {
+        let maxFont: CGFloat = 16.0
+        let minFont: CGFloat = 10.5
+        
+        for size in stride(from: maxFont, through: minFont, by: -0.5) {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: size, weight: .medium),
+                .paragraphStyle: paragraphStyle
+            ]
+            let bound = (text as NSString).boundingRect(
+                with: NSSize(width: max(targetSize.width, 40), height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: attrs
+            )
+            if bound.height <= targetSize.height + 4 {
+                return size
+            }
+        }
+        return minFont
+    }
+    
+    private func convertToView(_ normalized: CGRect) -> CGRect {
+        let x = normalized.origin.x * bounds.width
+        let y = normalized.origin.y * bounds.height
+        let w = normalized.size.width * bounds.width
+        let h = normalized.size.height * bounds.height
+        return CGRect(x: x, y: y, width: max(w, 48), height: max(h, 22))
+    }
+}
+
+// MARK: - Word Selection View
+
+class WordSelectionView: NSView {
+    let words: [WordBox]
+    var onComplete: ((String?) -> Void)?
+    var onCancel: (() -> Void)?
+    
+    private var selectedIndices: Set<Int> = []
+    private var anchorIndex: Int?
+    private var isDragging = false
+    
+    init(words: [WordBox]) {
+        self.words = words
+        super.init(frame: .zero)
+    }
+    
+    required init?(coder: NSCoder) { fatalError() }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.black.withAlphaComponent(0.12).setFill()
+        bounds.fill()
+        
+        for (i, word) in words.enumerated() {
+            let rect = convertToView(word.rect).insetBy(dx: -2, dy: -1)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
+            if selectedIndices.contains(i) {
+                NSColor.systemBlue.withAlphaComponent(0.55).setFill()
+                path.fill()
+            } else {
+                NSColor.white.withAlphaComponent(0.12).setStroke()
+                path.lineWidth = 0.8
+                path.stroke()
+            }
+        }
+    }
+    
+    private func convertToView(_ normalized: CGRect) -> CGRect {
+        let x = normalized.origin.x * bounds.width
+        let y = normalized.origin.y * bounds.height
+        let w = normalized.size.width * bounds.width
+        let h = normalized.size.height * bounds.height
+        return CGRect(x: x, y: y, width: max(w, 16), height: max(h, 14))
+    }
+    
+    private func indexOfWord(at point: NSPoint) -> Int? {
+        for (i, word) in words.enumerated() {
+            if convertToView(word.rect).insetBy(dx: -4, dy: -2).contains(point) {
+                return i
+            }
+        }
+        return nil
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if let idx = indexOfWord(at: point) {
+            anchorIndex = idx
+            selectedIndices = [idx]
+            isDragging = true
+            needsDisplay = true
+        } else {
+            onCancel?()
+        }
+    }
+    
+    override func mouseDragged(with event: NSEvent) {
+        guard isDragging, let anchor = anchorIndex else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        if let current = indexOfWord(at: point) {
+            let low = min(anchor, current)
+            let high = max(anchor, current)
+            selectedIndices = Set(low...high)
+            needsDisplay = true
+        }
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        guard isDragging else { return }
+        isDragging = false
+        let sorted = selectedIndices.sorted()
+        let text = sorted.map { words[$0].word }.joined(separator: " ")
+        onComplete?(text.isEmpty ? nil : text)
+    }
+    
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            onCancel?()
+        }
+    }
+    
+    override var acceptsFirstResponder: Bool { true }
+}
+
+// MARK: - Entry
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
