@@ -43,6 +43,7 @@ final class FloatingPanel: NSPanel {
 
 // MARK: - App Delegate (Menu Bar Tool)
 
+@available(macOS 14.0, *)
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
@@ -1357,7 +1358,11 @@ if runningApps.count > 1 {
     exit(0)
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+if #available(macOS 14.0, *) {
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}
