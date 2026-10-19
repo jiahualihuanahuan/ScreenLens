@@ -803,96 +803,86 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         
         // Sort top-to-bottom, then left-to-right
         let sorted = items.sorted { a, b in
-            let verticalDiff = a.boundingBox.maxY - b.boundingBox.maxY
-            if abs(verticalDiff) > min(a.boundingBox.height, b.boundingBox.height) * 0.4 {
+            let dy = a.boundingBox.maxY - b.boundingBox.maxY
+            if abs(dy) > min(a.boundingBox.height, b.boundingBox.height) * 0.5 {
                 return a.boundingBox.maxY > b.boundingBox.maxY
             }
             return a.boundingBox.minX < b.boundingBox.minX
         }
         
-        struct ParagraphAccumulator {
+        struct Para {
             var text: String
             var unionBox: CGRect
-            var lastLineBox: CGRect
-            var firstLineMinX: CGFloat
-            var avgLineHeight: CGFloat
-            var lineCount: Int
+            var lastBox: CGRect
+            var firstMinX: CGFloat
+            var avgH: CGFloat
+            var count: Int
         }
         
-        var paragraphs: [ParagraphAccumulator] = []
+        var paras: [Para] = []
         
         for item in sorted {
             let box = item.boundingBox
-            var mergedIndex: Int?
+            var joined = false
             
-            // Only consider the most recent paragraph that is still close
-            for idx in paragraphs.indices.reversed() {
-                let candidate = paragraphs[idx]
+            // Try to join to the most recent paragraph that is still close
+            if let idx = paras.indices.last {
+                let p = paras[idx]
                 
-                // Same-line continuation (text wrapped horizontally)
-                let sameLineVerticalOverlap = min(candidate.lastLineBox.maxY, box.maxY) - max(candidate.lastLineBox.minY, box.minY)
-                let minH = min(candidate.lastLineBox.height, box.height)
-                let horizontalGap = box.minX - candidate.lastLineBox.maxX
-                if sameLineVerticalOverlap > minH * 0.4 && horizontalGap >= -0.02 && horizontalGap < candidate.avgLineHeight * 2.5 {
-                    mergedIndex = idx
-                    break
+                // Same-line horizontal continuation
+                let overlapY = min(p.lastBox.maxY, box.maxY) - max(p.lastBox.minY, box.minY)
+                let minH = min(p.lastBox.height, box.height)
+                let gapX = box.minX - p.lastBox.maxX
+                if overlapY > minH * 0.35 && gapX >= -0.03 && gapX < p.avgH * 3.0 {
+                    var cur = p
+                    cur.text = joinTextLines(cur.text, item.text)
+                    cur.unionBox = cur.unionBox.union(box)
+                    cur.lastBox = box
+                    cur.avgH = (cur.avgH * CGFloat(cur.count) + box.height) / CGFloat(cur.count + 1)
+                    cur.count += 1
+                    paras[idx] = cur
+                    joined = true
                 }
                 
-                // Vertical gap between this line and the last line of the candidate
-                let verticalGap = candidate.lastLineBox.minY - box.maxY
-                
-                // Large gap = definite paragraph break
-                if verticalGap > candidate.avgLineHeight * 1.8 {
-                    continue
-                }
-                
-                // Keep lines together if they are reasonably close and in the same column
-                let isVerticallyClose = verticalGap >= -candidate.avgLineHeight * 0.5 && verticalGap <= candidate.avgLineHeight * 1.4
-                
-                let heightRatio = box.height / max(candidate.avgLineHeight, 0.0001)
-                let isSimilarFontSize = heightRatio >= 0.6 && heightRatio <= 1.6
-                
-                // Same column: left edges close OR substantial horizontal overlap
-                let leftEdgeDiff = min(abs(box.minX - candidate.lastLineBox.minX), abs(box.minX - candidate.firstLineMinX))
-                let overlapX = min(candidate.unionBox.maxX, box.maxX) - max(candidate.unionBox.minX, box.minX)
-                let minWidth = min(candidate.unionBox.width, box.width)
-                let isSameColumn = leftEdgeDiff < 0.12 || overlapX > minWidth * 0.35
-                
-                // Only force a break on a clear sentence end + short line + larger gap
-                let sentenceEndings: Set<Character> = [".", "!", "?", "。", "！", "？"]
-                let endsWithPunctuation = candidate.text.last.map { sentenceEndings.contains($0) } ?? false
-                let isClearParagraphEnd = endsWithPunctuation
-                    && candidate.lastLineBox.width < candidate.unionBox.width * 0.55
-                    && verticalGap > candidate.avgLineHeight * 0.6
-                
-                if isVerticallyClose && isSimilarFontSize && isSameColumn && !isClearParagraphEnd {
-                    mergedIndex = idx
-                    break
+                // Vertical continuation in the same column
+                if !joined {
+                    let gapY = p.lastBox.minY - box.maxY
+                    let sameColumn = abs(box.minX - p.firstMinX) < 0.15 || abs(box.minX - p.lastBox.minX) < 0.15
+                    let closeEnough = gapY >= -p.avgH * 0.4 && gapY <= p.avgH * 1.6
+                    let similarSize = box.height / max(p.avgH, 0.001) > 0.5 && box.height / max(p.avgH, 0.001) < 2.0
+                    
+                    // Only break on a large gap or a clear paragraph end
+                    let endsSentence = [".", "!", "?", "。", "！", "？"].contains(p.text.last ?? " ")
+                    let shortEnd = p.lastBox.width < p.unionBox.width * 0.5
+                    let clearBreak = endsSentence && shortEnd && gapY > p.avgH * 0.8
+                    
+                    if sameColumn && closeEnough && similarSize && !clearBreak {
+                        var cur = p
+                        cur.text = joinTextLines(cur.text, item.text)
+                        cur.unionBox = cur.unionBox.union(box)
+                        cur.lastBox = box
+                        cur.avgH = (cur.avgH * CGFloat(cur.count) + box.height) / CGFloat(cur.count + 1)
+                        cur.count += 1
+                        paras[idx] = cur
+                        joined = true
+                    }
                 }
             }
             
-            if let idx = mergedIndex {
-                var current = paragraphs[idx]
-                current.text = joinTextLines(current.text, item.text)
-                current.unionBox = current.unionBox.union(box)
-                current.lastLineBox = box
-                current.avgLineHeight = (current.avgLineHeight * CGFloat(current.lineCount) + box.height) / CGFloat(current.lineCount + 1)
-                current.lineCount += 1
-                paragraphs[idx] = current
-            } else {
-                paragraphs.append(ParagraphAccumulator(
+            if !joined {
+                paras.append(Para(
                     text: item.text,
                     unionBox: box,
-                    lastLineBox: box,
-                    firstLineMinX: box.minX,
-                    avgLineHeight: box.height,
-                    lineCount: 1
+                    lastBox: box,
+                    firstMinX: box.minX,
+                    avgH: box.height,
+                    count: 1
                 ))
             }
         }
         
-        return paragraphs.map {
-            TextItem(text: $0.text, boundingBox: $0.unionBox, avgLineHeight: $0.avgLineHeight)
+        return paras.map {
+            TextItem(text: $0.text, boundingBox: $0.unionBox, avgLineHeight: $0.avgH)
         }
     }
     
