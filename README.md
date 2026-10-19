@@ -15,11 +15,26 @@ Menu bar app for macOS with global hotkeys for on-device screen translation and 
 - Accessibility permission (System Settings → Privacy & Security → Accessibility)
 - Translation language packs installed (System Settings → General → Language & Region → Translation Languages)
 
-## Build & Run
+## Install & Run
+
+### Option 1: Build and install with `bundle.sh` (recommended)
 
 ```bash
 git clone https://github.com/jiahualihuanahuan/ScreenLens.git
 cd ScreenLens
+chmod +x bundle.sh
+./bundle.sh
+```
+
+This builds a release binary, creates `/Applications/ScreenLens.app`, signs it ad-hoc, and launches it. The app then runs independently of Terminal.
+
+### Option 2: Download the prebuilt app
+
+Download `ScreenLens.app` from the latest [Release](https://github.com/jiahualihuanahuan/ScreenLens/releases), move it to `/Applications`, and open it.
+
+### Option 3: Run the binary directly (development)
+
+```bash
 swift build -c release
 .build/release/ScreenLens
 ```
