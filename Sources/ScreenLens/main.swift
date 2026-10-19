@@ -19,14 +19,17 @@ struct WordBox: Sendable {
 }
 
 struct TranslatedBlock: Sendable {
-    let text: String
+    let sourceText: String
+    let translatedText: String
     let boundingBox: CGRect
 }
 
 // MARK: - Non-activating Panel
 
 final class FloatingPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    var allowsKey: Bool = false
+    
+    override var canBecomeKey: Bool { allowsKey }
     override var canBecomeMain: Bool { false }
 }
 
@@ -39,7 +42,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var searchHotKey: HotKey?
     var overlayWindow: NSWindow?
     var selectionWindow: NSWindow?
-    var targetLanguage: String = "zh"
+    var targetLanguage: String = "zh-Hans"
     var inputMonitors: [Any] = []
     var isTranslating = false
     
@@ -54,8 +57,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenu()
         setupHotKeys()
         print("ScreenLens running. Hotkeys: ⌥⌘T translate active area, ⌥⌘S word-select search")
-        print("Translation stays until you move the mouse, click, or type.")
-        print("App stays running until you quit from the menu or terminal.")
     }
     
     func setupMenu() {
@@ -65,10 +66,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         
         let langMenu = NSMenu()
-        for lang in ["zh", "ja", "ko", "fr", "de", "es", "en"] {
-            let item = NSMenuItem(title: lang.uppercased(), action: #selector(setLanguage(_:)), keyEquivalent: "")
-            item.representedObject = lang
-            if lang == targetLanguage { item.state = .on }
+        let languages: [(title: String, code: String)] = [
+            ("ZH-HANS", "zh-Hans"),
+            ("JA", "ja"),
+            ("KO", "ko"),
+            ("FR", "fr"),
+            ("DE", "de"),
+            ("ES", "es"),
+            ("EN", "en")
+        ]
+        for lang in languages {
+            let item = NSMenuItem(title: lang.title, action: #selector(setLanguage(_:)), keyEquivalent: "")
+            item.representedObject = lang.code
+            if lang.code == targetLanguage { item.state = .on }
             langMenu.addItem(item)
         }
         let langItem = NSMenuItem(title: "Target Language", action: nil, keyEquivalent: "")
@@ -111,77 +121,84 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in await performWordSelectSearch() }
     }
     
-    // MARK: - Translate (active area only)
+    // MARK: - Coordinate Conversion (Quartz Top-Left -> AppKit Bottom-Left)
+    
+    func quartzToAppKit(_ quartzRect: CGRect) -> CGRect {
+        // Quartz 主屏幕原点在左上角，AppKit 主屏幕原点在左下角
+        let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? NSScreen.main?.frame.height ?? 1080
+        let appKitY = primaryScreenHeight - quartzRect.origin.y - quartzRect.height
+        return CGRect(
+            x: quartzRect.origin.x,
+            y: appKitY,
+            width: quartzRect.width,
+            height: quartzRect.height
+        )
+    }
+    
+    // MARK: - Translate (Active Area Only)
     
     func performTranslate() async {
         dismissTranslation()
-        print("Translate triggered")
         
-        if !AXIsProcessTrusted() {
-            showAlert("Accessibility permission is required. Enable ScreenLens (or Terminal) in System Settings → Privacy & Security → Accessibility, then try again.")
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        if !AXIsProcessTrustedWithOptions(options) {
+            showAlert("Accessibility permission is required. Enable ScreenLens in System Settings → Privacy & Security → Accessibility.")
             return
         }
         
-        guard let region = locateActiveTextRegion() else {
-            showAlert("Could not find an active window. Make sure a window is focused and Accessibility is enabled for this app.")
+        guard let quartzRegion = locateActiveTextRegion() else {
+            showAlert("Could not find an active window.")
             return
         }
-        
-        print("Translating active region: \(region)")
         
         do {
-            let imageURL = try await captureRegion(region)
-            let items = try await performOCR(on: imageURL)
-            try? FileManager.default.removeItem(at: imageURL)
+            let cgImage = try await captureRegionImage(quartzRegion)
+            let items = try await performOCR(on: cgImage)
             
-            guard !items.isEmpty else {
+            let validItems = items.compactMap { item -> TextItem? in
+                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : TextItem(text: trimmed, boundingBox: item.boundingBox)
+            }
+            
+            guard !validItems.isEmpty else {
                 showAlert("No text found in the active area.")
                 return
             }
             
-            var blocks: [TranslatedBlock] = []
-            for item in items {
-                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-                let translated = (try? await translate(text: trimmed, to: targetLanguage)) ?? trimmed
-                blocks.append(TranslatedBlock(text: translated, boundingBox: item.boundingBox))
-            }
+            let blocks = await translateBatch(items: validItems, to: targetLanguage)
+            guard !blocks.isEmpty else { return }
             
-            guard !blocks.isEmpty else {
-                showAlert("Nothing to translate in the active area.")
-                return
-            }
-            
-            showTranslationOverlay(blocks: blocks, region: region)
+            let appKitRegion = quartzToAppKit(quartzRegion)
+            showTranslationOverlay(blocks: blocks, appKitRegion: appKitRegion)
             startInputMonitoring()
             await HistoryLogger.shared.record(blocks: blocks)
-            print("Translation shown for active area only.")
         } catch {
             print("Translate error: \(error)")
             showAlert("Translate failed: \(error.localizedDescription)")
         }
     }
     
-    func showTranslationOverlay(blocks: [TranslatedBlock], region: CGRect) {
+    func showTranslationOverlay(blocks: [TranslatedBlock], appKitRegion: CGRect) {
         overlayWindow?.orderOut(nil)
         overlayWindow = nil
         
         let window = FloatingPanel(
-            contentRect: region,
+            contentRect: appKitRegion,
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
         )
+        window.allowsKey = false
         window.level = .statusBar
         window.backgroundColor = .clear
         window.isOpaque = false
         window.ignoresMouseEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        window.hasShadow = false
+        window.hasShadow = true
         window.isReleasedWhenClosed = false
-        window.setFrame(region, display: true)
+        window.setFrame(appKitRegion, display: true)
         
-        let view = TranslationOverlayView()
+        let view = TranslationOverlayView(frame: NSRect(origin: .zero, size: appKitRegion.size))
         view.blocks = blocks
         window.contentView = view
         window.orderFrontRegardless()
@@ -192,8 +209,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         isTranslating = true
         stopInputMonitors()
         
+        // 移除轻微 .mouseMoved 误触，改为点击、滚轮或按键时关闭浮层
         let mask: NSEvent.EventTypeMask = [
-            .mouseMoved,
             .leftMouseDown,
             .rightMouseDown,
             .otherMouseDown,
@@ -219,7 +236,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func dismissTranslation() {
         guard isTranslating || overlayWindow != nil else { return }
-        print("User input detected — dismissing translation")
         isTranslating = false
         stopInputMonitors()
         overlayWindow?.orderOut(nil)
@@ -230,37 +246,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func performWordSelectSearch() async {
         dismissTranslation()
-        print("Word select search triggered")
+        guard let screen = NSScreen.main else { return }
+        
         do {
-            let imageURL = try captureFullScreen()
-            let words = try await extractWords(from: imageURL)
-            try? FileManager.default.removeItem(at: imageURL)
+            // 将当前屏幕转换回 Quartz 坐标进行内存级全屏截取
+            let quartzScreenRect = CGRect(
+                x: screen.frame.origin.x,
+                y: (NSScreen.screens.first?.frame.height ?? screen.frame.height) - screen.frame.maxY,
+                width: screen.frame.width,
+                height: screen.frame.height
+            )
+            let cgImage = try await captureRegionImage(quartzScreenRect)
+            let words = try await extractWords(from: cgImage)
             
             guard !words.isEmpty else {
                 showAlert("No words found on screen.")
                 return
             }
             
-            showWordSelectionOverlay(words: words)
+            showWordSelectionOverlay(words: words, screenFrame: screen.frame)
         } catch {
-            print("Word select error: \(error)")
             showAlert("Failed to start word selection: \(error.localizedDescription)")
         }
     }
     
-    func showWordSelectionOverlay(words: [WordBox]) {
+    func showWordSelectionOverlay(words: [WordBox], screenFrame: CGRect) {
         selectionWindow?.orderOut(nil)
         selectionWindow = nil
         
-        guard let screen = NSScreen.main else { return }
-        let frame = screen.frame
-        
         let window = FloatingPanel(
-            contentRect: frame,
+            contentRect: screenFrame,
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
         )
+        window.allowsKey = true // 允许接收 Esc 键事件
         window.level = .statusBar
         window.backgroundColor = .clear
         window.isOpaque = false
@@ -268,15 +288,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.hasShadow = false
         window.isReleasedWhenClosed = false
-        window.setFrame(frame, display: true)
+        window.setFrame(screenFrame, display: true)
         
         let view = WordSelectionView(words: words)
         view.onComplete = { [weak self, weak window] selectedText in
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 window?.orderOut(nil)
-                if self?.selectionWindow === window {
-                    self?.selectionWindow = nil
-                }
+                if self?.selectionWindow === window { self?.selectionWindow = nil }
                 if let text = selectedText, !text.isEmpty {
                     self?.copyToClipboard(text)
                     self?.openGoogleSearch(query: text)
@@ -284,16 +302,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         view.onCancel = { [weak self, weak window] in
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 window?.orderOut(nil)
-                if self?.selectionWindow === window {
-                    self?.selectionWindow = nil
-                }
+                if self?.selectionWindow === window { self?.selectionWindow = nil }
             }
         }
         
         window.contentView = view
         window.orderFrontRegardless()
+        window.makeKey()
+        window.makeFirstResponder(view)
         selectionWindow = window
     }
     
@@ -301,44 +319,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
-        print("Copied to clipboard: \(text)")
     }
     
     func openGoogleSearch(query: String) {
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
         if let url = URL(string: "https://www.google.com/search?q=\(encoded)") {
             NSWorkspace.shared.open(url)
-            print("Opened search for: \(query)")
         }
     }
     
-    // MARK: - Region & Capture
+    // MARK: - Region & In-Memory Capture
     
     nonisolated func locateActiveTextRegion() -> CGRect? {
         let systemWide = AXUIElementCreateSystemWide()
         var focusedApp: AnyObject?
-        let appResult = AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp)
-        print("AX focused app result: \(appResult.rawValue)")
-        guard appResult == .success, let appElement = focusedApp as! AXUIElement? else {
-            print("Failed to get focused application")
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedApp) == .success,
+              let appElement = focusedApp as! AXUIElement? else {
             return nil
         }
         
         var windowElement: AnyObject?
-        let winResult = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowElement)
-        print("AX focused window result: \(winResult.rawValue)")
-        guard winResult == .success, let window = windowElement as! AXUIElement? else {
-            print("Failed to get focused window")
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowElement) == .success,
+              let window = windowElement as! AXUIElement? else {
             return nil
         }
         
         var posValue: AnyObject?
         var sizeValue: AnyObject?
-        let posResult = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posValue)
-        let sizeResult = AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue)
-        print("AX position result: \(posResult.rawValue), size result: \(sizeResult.rawValue)")
-        guard posResult == .success, sizeResult == .success else {
-            print("Failed to get window position/size")
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posValue) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue) == .success else {
             return nil
         }
         
@@ -348,8 +357,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
         
         var raw = CGRect(origin: point, size: size)
-        print("Raw window rect: \(raw)")
-        
         if raw.width > 400 && raw.height > 300 {
             raw = CGRect(
                 x: raw.origin.x + raw.width * 0.04,
@@ -359,55 +366,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         
-        guard raw.width > 80, raw.height > 40 else {
-            print("Region too small: \(raw)")
-            return nil
-        }
+        guard raw.width > 80, raw.height > 40 else { return nil }
         return raw
     }
     
-    nonisolated func captureFullScreen() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-\(UUID().uuidString).png")
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        process.arguments = ["-x", url.path]
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: url.path) else {
-            throw NSError(domain: "ScreenLens", code: 1, userInfo: [NSLocalizedDescriptionKey: "Screen capture failed. Grant Screen Recording permission."])
-        }
-        return url
-    }
-    
-    func captureRegion(_ rect: CGRect) async throws -> URL {
+    func captureRegionImage(_ quartzRect: CGRect) async throws -> CGImage {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else {
+        // 匹配包含目标区域的显示器（支持多显示器扩展）
+        guard let display = content.displays.first(where: { $0.frame.intersects(quartzRect) }) ?? content.displays.first else {
             throw NSError(domain: "ScreenLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "No display found"])
         }
         
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // 排除当前应用自身窗口，防止连续触发时截取到自身的悬浮层
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let excludedWindows = content.windows.filter { $0.owningApplication?.processID == ownPID }
+        
+        let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
         let config = SCStreamConfiguration()
-        config.sourceRect = rect
-        config.width = Int(rect.width * 2)
-        config.height = Int(rect.height * 2)
+        
+        // 转换为相对于当前 SCDisplay 的局部坐标
+        let localRect = CGRect(
+            x: quartzRect.origin.x - display.frame.origin.x,
+            y: quartzRect.origin.y - display.frame.origin.y,
+            width: quartzRect.width,
+            height: quartzRect.height
+        )
+        config.sourceRect = localRect
+        config.width = Int(localRect.width * 2)
+        config.height = Int(localRect.height * 2)
         config.showsCursor = false
         
-        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("screenlens-\(UUID().uuidString).png")
-        let rep = NSBitmapImageRep(cgImage: image)
-        if let data = rep.representation(using: .png, properties: [:]) {
-            try data.write(to: url)
-            return url
-        }
-        throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to write region capture"])
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
     }
     
-    nonisolated func performOCR(on imageURL: URL) async throws -> [TextItem] {
-        guard let cgImage = NSImage(contentsOf: imageURL)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to load image"])
-        }
-        
-        return try await withCheckedThrowingContinuation { continuation in
+    // MARK: - Vision OCR (Direct CGImage)
+    
+    nonisolated func performOCR(on cgImage: CGImage) async throws -> [TextItem] {
+        try await withCheckedThrowingContinuation { continuation in
             let request = VNRecognizeTextRequest { request, error in
                 if let error = error {
                     continuation.resume(throwing: error)
@@ -423,6 +418,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
             request.automaticallyDetectsLanguage = true
+            
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             do {
                 try handler.perform([request])
@@ -432,12 +428,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    nonisolated func extractWords(from imageURL: URL) async throws -> [WordBox] {
-        guard let cgImage = NSImage(contentsOf: imageURL)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to load image"])
-        }
-        
-        return try await withCheckedThrowingContinuation { continuation in
+    nonisolated func extractWords(from cgImage: CGImage) async throws -> [WordBox] {
+        try await withCheckedThrowingContinuation { continuation in
             let request = VNRecognizeTextRequest { request, error in
                 if let error = error {
                     continuation.resume(throwing: error)
@@ -470,6 +462,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
+            request.automaticallyDetectsLanguage = true
+            
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             do {
                 try handler.perform([request])
@@ -479,19 +473,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    nonisolated func translate(text: String, to target: String) async throws -> String {
+    // MARK: - Batch Translation
+    
+    nonisolated func translateBatch(items: [TextItem], to target: String) async -> [TranslatedBlock] {
         let source = Locale.Language(identifier: "en")
         let targetLang = Locale.Language(identifier: target)
+        
         if #available(macOS 26.0, *) {
-            do {
-                let session = TranslationSession(installedSource: source, target: targetLang)
-                let response = try await session.translate(text)
-                return response.targetText
-            } catch {
-                return text
+            let session = TranslationSession(installedSource: source, target: targetLang)
+            let requests = items.enumerated().map { idx, item in
+                TranslationSession.Request(sourceText: item.text, clientIdentifier: "\(idx)")
             }
-        } else {
-            return text
+            if let responses = try? await session.translations(from: requests) {
+                var results: [TranslatedBlock] = []
+                for response in responses {
+                    if let idStr = response.clientIdentifier, let idx = Int(idStr), idx < items.count {
+                        results.append(TranslatedBlock(
+                            sourceText: items[idx].text,
+                            translatedText: response.targetText,
+                            boundingBox: items[idx].boundingBox
+                        ))
+                    }
+                }
+                if !results.isEmpty { return results }
+            }
+        }
+        
+        return items.map {
+            TranslatedBlock(sourceText: $0.text, translatedText: $0.text, boundingBox: $0.boundingBox)
         }
     }
     
@@ -503,7 +512,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - History Logger
+// MARK: - History Logger (Bilingual Markdown)
 
 actor HistoryLogger {
     static let shared = HistoryLogger()
@@ -519,8 +528,9 @@ actor HistoryLogger {
     
     func record(blocks: [TranslatedBlock]) {
         guard !blocks.isEmpty else { return }
-        let source = blocks.map(\.text).joined(separator: "\n")
-        let hash = source.hashValue
+        let combinedSource = blocks.map(\.sourceText).joined(separator: "\n")
+        let combinedTarget = blocks.map(\.translatedText).joined(separator: "\n")
+        let hash = combinedSource.hashValue ^ combinedTarget.hashValue
         guard hash != lastHash else { return }
         lastHash = hash
         
@@ -528,7 +538,11 @@ actor HistoryLogger {
         let entry = """
         
         ## \(now)
-        \(source)
+        **Source:**
+        > \(combinedSource.replacingOccurrences(of: "\n", with: "\n> "))
+        
+        **Translation:**
+        \(combinedTarget)
         
         ---
         """
@@ -545,32 +559,43 @@ actor HistoryLogger {
     }
 }
 
-// MARK: - Translation Overlay View
+// MARK: - Glassmorphic Translation Overlay View
 
 class TranslationOverlayView: NSView {
-    var blocks: [TranslatedBlock] = []
+    var blocks: [TranslatedBlock] = [] {
+        didSet { needsDisplay = true }
+    }
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .left
-        paragraph.lineBreakMode = .byWordWrapping
-        
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: paragraph
-        ]
+        paragraph.lineBreakMode = .byTruncatingTail
         
         for block in blocks {
             let rect = convertToView(block.boundingBox)
-            let coverRect = rect.insetBy(dx: -4, dy: -2)
-            NSColor.black.withAlphaComponent(0.88).setFill()
-            coverRect.fill()
+            let coverRect = rect.insetBy(dx: -6, dy: -3)
             
-            let drawRect = coverRect.insetBy(dx: 3, dy: 1)
-            let attrStr = NSAttributedString(string: block.text, attributes: attrs)
+            // Glassmorphic 拟态半透明深色卡片 + 1px 微光描边
+            let path = NSBezierPath(roundedRect: coverRect, xRadius: 6, yRadius: 6)
+            NSColor(calibratedWhite: 0.10, alpha: 0.86).setFill()
+            path.fill()
+            
+            NSColor.white.withAlphaComponent(0.22).setStroke()
+            path.lineWidth = 1.0
+            path.stroke()
+            
+            // 根据原文本框高度自适应字体大小
+            let dynamicFontSize = max(min(rect.height * 0.72, 16), 11)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: dynamicFontSize, weight: .medium),
+                .foregroundColor: NSColor.white,
+                .paragraphStyle: paragraph
+            ]
+            
+            let drawRect = coverRect.insetBy(dx: 5, dy: 2)
+            let attrStr = NSAttributedString(string: block.translatedText, attributes: attrs)
             attrStr.draw(in: drawRect)
         }
     }
@@ -580,7 +605,7 @@ class TranslationOverlayView: NSView {
         let y = normalized.origin.y * bounds.height
         let w = normalized.size.width * bounds.width
         let h = normalized.size.height * bounds.height
-        return CGRect(x: x, y: y, width: max(w, 36), height: max(h, 18))
+        return CGRect(x: x, y: y, width: max(w, 40), height: max(h, 20))
     }
 }
 
@@ -604,14 +629,19 @@ class WordSelectionView: NSView {
     
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        NSColor.black.withAlphaComponent(0.08).setFill()
+        NSColor.black.withAlphaComponent(0.12).setFill()
         bounds.fill()
         
         for (i, word) in words.enumerated() {
-            let rect = convertToView(word.rect)
+            let rect = convertToView(word.rect).insetBy(dx: -2, dy: -1)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
             if selectedIndices.contains(i) {
-                NSColor.systemBlue.withAlphaComponent(0.5).setFill()
-                rect.fill()
+                NSColor.systemBlue.withAlphaComponent(0.55).setFill()
+                path.fill()
+            } else {
+                NSColor.white.withAlphaComponent(0.12).setStroke()
+                path.lineWidth = 0.8
+                path.stroke()
             }
         }
     }
@@ -626,7 +656,7 @@ class WordSelectionView: NSView {
     
     private func indexOfWord(at point: NSPoint) -> Int? {
         for (i, word) in words.enumerated() {
-            if convertToView(word.rect).contains(point) {
+            if convertToView(word.rect).insetBy(dx: -4, dy: -2).contains(point) {
                 return i
             }
         }
@@ -665,7 +695,7 @@ class WordSelectionView: NSView {
     }
     
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 {
+        if event.keyCode == 53 { // Escape
             onCancel?()
         }
     }
