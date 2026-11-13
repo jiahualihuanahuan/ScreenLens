@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 /// Decides how much of a window's top (title bar / tab bar / toolbar / URL bar / bookmarks bar)
 /// must be skipped so that only the main content is translated.

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 /// One Vision text-recognition pass over (part of) a captured image.
 public struct OCRPassSpec: Equatable, Sendable {

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 /// Pure geometry helpers shared by the app target. They deliberately depend on
 /// Foundation only (no AppKit / ScreenCaptureKit) so they can be unit-tested on any platform.
