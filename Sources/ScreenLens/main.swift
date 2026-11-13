@@ -8,6 +8,7 @@ import ApplicationServices
 import ServiceManagement
 import CoreImage
 import Foundation
+import ScreenLensCore
 
 // MARK: - Models
 
@@ -29,6 +30,27 @@ struct TranslatedBlock: Sendable {
     let translatedText: String
     let boundingBox: CGRect // Vision normalized (0...1, bottom-left origin)
     let avgLineHeight: CGFloat
+}
+
+extension TextItem: OCRBoxed {
+    var ocrBox: CGRect { boundingBox }
+    var ocrConfidence: Float { confidence }
+    var ocrTextLength: Int { text.count }
+}
+
+extension WordBox: OCRBoxed {
+    var ocrBox: CGRect { rect }
+    var ocrConfidence: Float { confidence }
+    var ocrTextLength: Int { word.count }
+}
+
+/// A screen capture together with the geometry needed to map OCR results back to the screen.
+struct CapturedRegion {
+    let image: CGImage
+    /// Region actually captured, in Quartz global points (top-left origin), clamped to one display.
+    let quartzRect: CGRect
+    /// Real pixels per point of `image` (derived from the image, not assumed from NSScreen).
+    let pointPixelScale: CGFloat
 }
 
 struct ActiveContentTarget: Sendable {
@@ -398,48 +420,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Universal Multi-Screen Coordinate Conversion (Quartz Top-Left <-> AppKit Bottom-Left)
 
+    /// Height (points) of the display that owns the global origin. Quartz y=0 is the top of THAT display,
+    /// whichever display is currently "main" or focused, and no matter how external monitors are arranged.
     private func primaryScreenHeight() -> CGFloat {
-        // Quartz global origin (0,0) is always anchored at the top-left of the screen at AppKit (0,0)
         return NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
             ?? NSScreen.screens.first?.frame.height
-            ?? 1080
+            ?? CGDisplayBounds(CGMainDisplayID()).height
     }
 
     func quartzToAppKit(_ quartzRect: CGRect) -> CGRect {
-        let mainH = primaryScreenHeight()
-        return CGRect(
-            x: quartzRect.origin.x,
-            y: mainH - quartzRect.origin.y - quartzRect.height,
-            width: quartzRect.width,
-            height: quartzRect.height
-        )
+        ScreenGeometry.quartzToAppKit(quartzRect, primaryHeight: primaryScreenHeight())
     }
 
     func appKitToQuartz(_ appKitRect: CGRect) -> CGRect {
-        let mainH = primaryScreenHeight()
-        return CGRect(
-            x: appKitRect.origin.x,
-            y: mainH - appKitRect.maxY,
-            width: appKitRect.width,
-            height: appKitRect.height
-        )
+        ScreenGeometry.appKitToQuartz(appKitRect, primaryHeight: primaryScreenHeight())
     }
 
     func screenContaining(quartzRect: CGRect) -> NSScreen {
         let appKitRect = quartzToAppKit(quartzRect)
-        var bestScreen: NSScreen?
-        var bestArea: CGFloat = 0
-        for screen in NSScreen.screens {
-            let inter = screen.frame.intersection(appKitRect)
-            if !inter.isNull {
-                let area = inter.width * inter.height
-                if area > bestArea {
-                    bestArea = area
-                    bestScreen = screen
-                }
-            }
+        let screens = NSScreen.screens
+        if let idx = ScreenGeometry.bestMatchIndex(for: appKitRect, in: screens.map(\.frame)) {
+            return screens[idx]
         }
-        return bestScreen ?? NSScreen.main ?? NSScreen.screens[0]
+        return NSScreen.main ?? screens[0]
     }
 
     func currentMouseScreen() -> NSScreen {
@@ -533,8 +536,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defer { setStatusLoading(false) }
 
         do {
-            let (cgImage, actualQuartzRegion) = try await captureRegionImage(requestedQuartzRegion)
-            let rawItems = try await performMultiScaleOCR(on: cgImage)
+            let captured = try await captureRegionImage(requestedQuartzRegion)
+            let actualQuartzRegion = captured.quartzRect
+            let rawItems = try await performMultiScaleOCR(on: captured.image, pointPixelScale: captured.pointPixelScale)
             let mergedParagraphs = mergeIntoParagraphs(rawItems)
 
             let filtered = mergedParagraphs.filter { item in
@@ -542,7 +546,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     item,
                     isMainContentMode: isMainContentMode,
                     targetInfo: targetInfo,
-                    regionHeightPts: actualQuartzRegion.height
+                    regionSizePts: actualQuartzRegion.size
                 )
             }
 
@@ -580,7 +584,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ item: TextItem,
         isMainContentMode: Bool,
         targetInfo: ActiveContentTarget?,
-        regionHeightPts: CGFloat
+        regionSizePts: CGSize
     ) -> Bool {
         let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -592,8 +596,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let box = item.boundingBox
 
+        // All thresholds below are in POINTS (via regionSizePts), not fractions of the capture,
+        // so behaviour is the same on a 13" laptop and on a 32" external display.
+
         // Drop extreme left/right window border artifacts (scrollbars, resize handles)
-        if box.minX < 0.01 || box.maxX > 0.99 { return false }
+        if ContentFilter.isWindowBorderArtifact(normalizedBox: box, regionSize: regionSizePts) { return false }
 
         // Require minimum meaningful characters (CJK needs fewer chars than Latin)
         if trimmed.containsCJK {
@@ -607,9 +614,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
 
-        // Ignore narrow single-line edge navigation/sidebar rails on wide windows
-        let isSingleLineHeight = box.height < 0.032
-        if isSingleLineHeight && box.width < 0.14 && (box.maxX < 0.16 || box.minX > 0.84) {
+        // Ignore narrow single-line edge navigation/sidebar rails
+        if ContentFilter.isEdgeRailLabel(normalizedBox: box, regionSize: regionSizePts) {
             return false
         }
 
@@ -618,7 +624,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let isBrowser = targetInfo?.isBrowserWindow ?? false
 
         if !exactAX {
-            let distFromTopPts = (1.0 - box.maxY) * regionHeightPts
+            let distFromTopPts = ContentFilter.distanceFromTop(normalizedBox: box, regionSize: regionSizePts)
 
             // Filter URL bar strings near the top edge
             if distFromTopPts < 110 {
@@ -629,7 +635,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             // Filter narrow single-line browser tab titles / bookmark items in the top chrome strip
-            if isBrowser && distFromTopPts < 88 && box.width < 0.28 && box.height < 0.032 {
+            if isBrowser && ContentFilter.isTopStripLabel(normalizedBox: box, regionSize: regionSizePts) {
                 return false
             }
         }
@@ -724,8 +730,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         do {
             let quartzScreenRect = appKitToQuartz(screenFrame)
-            let (cgImage, actualQuartzRect) = try await captureRegionImage(quartzScreenRect)
-            let words = try await extractWordsMultiScale(from: cgImage)
+            let captured = try await captureRegionImage(quartzScreenRect)
+            let actualQuartzRect = captured.quartzRect
+            let words = try await extractWordsMultiScale(from: captured.image, pointPixelScale: captured.pointPixelScale)
 
             guard !words.isEmpty else {
                 NSSound.beep()
@@ -817,6 +824,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 1. Accessibility Lookup: Exact AXWebArea (browsers) or primary AXScrollArea (document apps)
         if let pid = effectivePID, pid != ownPID, AXIsProcessTrusted() {
             let appElement = AXUIElementCreateApplication(pid)
+            // Never let a hung app freeze the hotkey: cap every AX round trip.
+            AXUIElementSetMessagingTimeout(appElement, 0.25)
             AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, true as CFBoolean)
             AXUIElementSetAttributeValue(appElement, "AXEnhancedUserInterface" as CFString, true as CFBoolean)
 
@@ -824,57 +833,73 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                let windowRect = frameOfAXElement(windowElement),
                windowRect.width > 120, windowRect.height > 100 {
 
+                // Use the display that holds most of the window (not "the main screen").
                 let screen = screenContaining(quartzRect: windowRect)
                 let usableQuartz = appKitToQuartz(safeUsableAppKitFrame(for: screen))
                 let clampedWindow = windowRect.intersection(usableQuartz)
 
-                // A. Try AXWebArea first (automatically excludes macOS menu bar, tabs, URL bar, and bookmarks bar)
-                if let webArea = findLargestElement(
-                    matchingRoles: ["AXWebArea"],
-                    root: windowElement,
-                    within: clampedWindow,
-                    maxDepth: 14
-                ), let webRect = frameOfAXElement(webArea) {
-                    let exact = webRect.intersection(clampedWindow)
-                    if exact.width > 120 && exact.height > 100 {
-                        return ActiveContentTarget(
-                            quartzRect: exact,
-                            isExactContentArea: true,
-                            isBrowserWindow: isBrowser
-                        )
+                if !clampedWindow.isNull && clampedWindow.width > 120 && clampedWindow.height > 100 {
+                    // A. Try AXWebArea first (automatically excludes macOS menu bar, tabs, URL bar, and bookmarks bar)
+                    if let webArea = findLargestElement(
+                        matchingRoles: ["AXWebArea"],
+                        root: windowElement,
+                        within: clampedWindow,
+                        maxDepth: 14
+                    ), let webRect = frameOfAXElement(webArea) {
+                        let exact = webRect.intersection(clampedWindow)
+                        if exact.width > 120 && exact.height > 100 {
+                            return ActiveContentTarget(
+                                quartzRect: exact,
+                                isExactContentArea: true,
+                                isBrowserWindow: isBrowser
+                            )
+                        }
                     }
-                }
 
-                // B. For native document/reader apps (Preview, Notes, Pages, Mail), try primary AXScrollArea
-                if !isBrowser,
-                   let scrollArea = findLargestElement(
-                    matchingRoles: ["AXScrollArea"],
-                    root: windowElement,
-                    within: clampedWindow,
-                    maxDepth: 8
-                   ),
-                   let scrollRect = frameOfAXElement(scrollArea) {
-                    let exact = scrollRect.intersection(clampedWindow)
-                    if exact.width >= clampedWindow.width * 0.55 && exact.height >= clampedWindow.height * 0.55 {
-                        return ActiveContentTarget(
-                            quartzRect: exact,
-                            isExactContentArea: true,
-                            isBrowserWindow: false
-                        )
+                    // B. For native document/reader apps (Preview, Notes, Pages, Mail), try primary AXScrollArea
+                    if !isBrowser,
+                       let scrollArea = findLargestElement(
+                        matchingRoles: ["AXScrollArea"],
+                        root: windowElement,
+                        within: clampedWindow,
+                        maxDepth: 8
+                       ),
+                       let scrollRect = frameOfAXElement(scrollArea) {
+                        let exact = scrollRect.intersection(clampedWindow)
+                        if exact.width >= clampedWindow.width * 0.55 && exact.height >= clampedWindow.height * 0.55 {
+                            return ActiveContentTarget(
+                                quartzRect: exact,
+                                isExactContentArea: true,
+                                isBrowserWindow: false
+                            )
+                        }
                     }
-                }
 
-                // C. Window found via AX, but no AXWebArea exposed -> trim top chrome proportionally
-                let trimmed = trimWindowChrome(
-                    windowQuartzRect: clampedWindow,
-                    isBrowser: isBrowser,
-                    bundleID: bundleID
-                )
-                return ActiveContentTarget(
-                    quartzRect: trimmed,
-                    isExactContentArea: false,
-                    isBrowserWindow: isBrowser
-                )
+                    // C. Window found via AX, but no web/scroll area exposed -> measure the real toolbar /
+                    //    tab strip bottoms from the AX tree; fall back to a heuristic only if none exist.
+                    let chromeBottoms = findChromeBottoms(
+                        root: windowElement,
+                        windowRect: clampedWindow,
+                        isBrowser: isBrowser
+                    )
+                    let measured = ContentChrome.insetFromChromeBottoms(
+                        windowRect: clampedWindow,
+                        chromeBottoms: chromeBottoms
+                    )
+                    let trimmed = trimWindowChrome(
+                        windowQuartzRect: clampedWindow,
+                        isBrowser: isBrowser,
+                        bundleID: bundleID,
+                        isFullScreen: isFullScreenWindow(windowElement, rect: windowRect, screen: screen),
+                        measuredTopInset: measured,
+                        accessibilityKnown: true
+                    )
+                    return ActiveContentTarget(
+                        quartzRect: trimmed,
+                        isExactContentArea: false,
+                        isBrowserWindow: isBrowser
+                    )
+                }
             }
         }
 
@@ -888,7 +913,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let trimmed = trimWindowChrome(
                     windowQuartzRect: clampedWindow,
                     isBrowser: isBrowser,
-                    bundleID: bundleID
+                    bundleID: bundleID,
+                    isFullScreen: Self.rectCoversScreen(rawWindowRect, screen: screen, quartz: appKitToQuartz(screen.frame)),
+                    measuredTopInset: nil,
+                    accessibilityKnown: false
                 )
                 return ActiveContentTarget(
                     quartzRect: trimmed,
@@ -908,28 +936,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
-    private func trimWindowChrome(windowQuartzRect: CGRect, isBrowser: Bool, bundleID: String) -> CGRect {
-        // Covers title/tab bar (~40pt) + address/URL bar (~42pt) + bookmarks bar (~32pt)
-        var topInset: CGFloat = isBrowser ? 114.0 : 52.0
-        var leftInset: CGFloat = 0.0
-
-        // Arc uses a left sidebar + slim top URL bar rather than tall top tabs + bookmarks
-        if bundleID == "company.thebrowser.Browser" {
-            topInset = 24.0
-            if windowQuartzRect.width > 920 {
-                leftInset = 215.0
-            }
+    /// Skips the title bar / tab strip / toolbar / bookmarks bar. Uses measured AX toolbar bottoms when
+    /// available, otherwise `ContentChrome` heuristics (which are capped relative to the window height).
+    private func trimWindowChrome(
+        windowQuartzRect: CGRect,
+        isBrowser: Bool,
+        bundleID: String,
+        isFullScreen: Bool,
+        measuredTopInset: CGFloat?,
+        accessibilityKnown: Bool
+    ) -> CGRect {
+        let isArc = bundleID == "company.thebrowser.Browser"
+        let topInset: CGFloat
+        if let measured = measuredTopInset {
+            // +1pt so the toolbar's bottom border line is not OCR'd as text.
+            topInset = measured + 1
+        } else {
+            topInset = ContentChrome.fallbackTopInset(
+                windowRect: windowQuartzRect,
+                isBrowser: isBrowser,
+                isArc: isArc,
+                isFullScreen: isFullScreen,
+                accessibilityKnown: accessibilityKnown
+            )
         }
-
-        // Never trim more than 24% of the window height on compact windows
-        topInset = min(topInset, windowQuartzRect.height * 0.24)
-
-        return CGRect(
-            x: windowQuartzRect.origin.x + leftInset,
-            y: windowQuartzRect.origin.y + topInset,
-            width: max(windowQuartzRect.width - leftInset, 100),
-            height: max(windowQuartzRect.height - topInset, 80)
+        let leftInset = ContentChrome.fallbackLeftInset(
+            windowRect: windowQuartzRect,
+            isArc: isArc,
+            isFullScreen: isFullScreen
         )
+        return ContentChrome.contentRect(window: windowQuartzRect, topInset: topInset, leftInset: leftInset)
+    }
+
+    private static func rectCoversScreen(_ windowRect: CGRect, screen: NSScreen, quartz screenQuartz: CGRect) -> Bool {
+        return windowRect.width >= screenQuartz.width - 2 && windowRect.height >= screenQuartz.height - 2
+    }
+
+    private func isFullScreenWindow(_ window: AXUIElement, rect: CGRect, screen: NSScreen) -> Bool {
+        var ref: CFTypeRef?
+        if AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &ref) == .success,
+           let number = ref as? NSNumber {
+            return number.boolValue
+        }
+        return Self.rectCoversScreen(rect, screen: screen, quartz: appKitToQuartz(screen.frame))
     }
 
     private func focusedOrMainWindow(for appElement: AXUIElement) -> AXUIElement? {
@@ -948,24 +997,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (obj as! AXUIElement)
     }
 
+    private static let axContentRoles: Set<String> = [
+        "AXWebArea", "AXTable", "AXOutline", "AXList", "AXTextArea", "AXBrowser"
+    ]
+
+    /// Breadth-first search for the largest element with one of `targetRoles`.
+    /// Bounded by depth, node count and wall-clock time, and it never descends into web content, because
+    /// a browser page can expose thousands of nodes and each AX call is an IPC round trip.
     private func findLargestElement(
         matchingRoles targetRoles: Set<String>,
         root: AXUIElement,
         within bounds: CGRect,
-        maxDepth: Int
+        maxDepth: Int,
+        maxNodes: Int = 1500,
+        timeBudget: TimeInterval = 0.6
     ) -> AXUIElement? {
         var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
+        var head = 0
         var bestElement: AXUIElement?
         var bestArea: CGFloat = 0
+        var visited = 0
+        let deadline = Date().addingTimeInterval(timeBudget)
 
-        while !queue.isEmpty {
-            let (current, depth) = queue.removeFirst()
+        while head < queue.count {
+            let (current, depth) = queue[head]
+            head += 1
+            visited += 1
+            if visited > maxNodes || Date() > deadline { break }
 
             var roleRef: CFTypeRef?
+            var role = ""
             if AXUIElementCopyAttributeValue(current, kAXRoleAttribute as CFString, &roleRef) == .success,
-               let role = roleRef as? String,
-               targetRoles.contains(role),
-               let rect = frameOfAXElement(current) {
+               let r = roleRef as? String {
+                role = r
+            }
+
+            if targetRoles.contains(role), let rect = frameOfAXElement(current) {
                 let clipped = rect.intersection(bounds)
                 if !clipped.isNull {
                     let area = clipped.width * clipped.height
@@ -976,7 +1043,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
 
-            if depth < maxDepth {
+            // Do not walk into page / document content (except when that is what we are looking for).
+            let isContentContainer = Self.axContentRoles.contains(role) && !targetRoles.contains(role)
+            if role == "AXWebArea" { continue }
+            if depth < maxDepth && !isContentContainer {
                 var childrenRef: CFTypeRef?
                 if AXUIElementCopyAttributeValue(current, kAXChildrenAttribute as CFString, &childrenRef) == .success,
                    let children = childrenRef as? [AXUIElement] {
@@ -988,6 +1058,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         return bestElement
+    }
+
+    /// Bottom edges (Quartz y) of toolbars and, for browsers, tab strips that span the window width
+    /// near its top. These are the real "chrome" boundaries on any screen size / window size / theme.
+    private func findChromeBottoms(root: AXUIElement, windowRect: CGRect, isBrowser: Bool) -> [CGFloat] {
+        var wanted: Set<String> = ["AXToolbar"]
+        if isBrowser { wanted.insert("AXTabGroup") }
+
+        var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
+        var head = 0
+        var visited = 0
+        var bottoms: [CGFloat] = []
+        let deadline = Date().addingTimeInterval(0.4)
+        let topZone = windowRect.minY + windowRect.height * 0.35
+
+        while head < queue.count {
+            let (current, depth) = queue[head]
+            head += 1
+            visited += 1
+            if visited > 600 || Date() > deadline { break }
+
+            var roleRef: CFTypeRef?
+            var role = ""
+            if AXUIElementCopyAttributeValue(current, kAXRoleAttribute as CFString, &roleRef) == .success,
+               let r = roleRef as? String {
+                role = r
+            }
+
+            if wanted.contains(role), let rect = frameOfAXElement(current),
+               rect.width >= windowRect.width * 0.3,
+               rect.minY < topZone, rect.height > 4 {
+                bottoms.append(rect.maxY)
+            }
+
+            if Self.axContentRoles.contains(role) || role == "AXScrollArea" { continue }
+            if depth < 6 {
+                var childrenRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(current, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                   let children = childrenRef as? [AXUIElement] {
+                    for child in children {
+                        queue.append((child, depth + 1))
+                    }
+                }
+            }
+        }
+        return bottoms
     }
 
     private func frameOfAXElement(_ element: AXUIElement) -> CGRect? {
@@ -1055,21 +1171,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return topmostAnyAppRect
     }
 
-    // MARK: - 1:1 Clamped Screen Capture
+    // MARK: - Native-Pixel Clamped Screen Capture
 
-    func captureRegionImage(_ quartzRect: CGRect) async throws -> (CGImage, CGRect) {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first(where: { $0.frame.intersects(quartzRect) }) ?? content.displays.first else {
-            throw NSError(domain: "ScreenLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "No display found"])
+    /// Real pixels-per-point of a display as ScreenCaptureKit will deliver them. This is the capture's own
+    /// answer (correct for Retina, "More Space" scaled modes and non-Retina externals), with NSScreen as backup.
+    private func pointPixelScale(for filter: SCContentFilter, display: SCDisplay) -> CGFloat {
+        let fromFilter = CGFloat(SCShareableContent.info(for: filter).pointPixelScale)
+        if fromFilter >= 1 { return fromFilter }
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        if let screen = NSScreen.screens.first(where: {
+            ($0.deviceDescription[key] as? NSNumber)?.uint32Value == display.displayID
+        }) {
+            return screen.backingScaleFactor
         }
+        return 2
+    }
 
-        let clampedQuartz = quartzRect.intersection(display.frame).integral
-        guard clampedQuartz.width > 32, clampedQuartz.height > 32 else {
+    func captureRegionImage(_ quartzRect: CGRect) async throws -> CapturedRegion {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let displays = content.displays
+
+        // The display that holds most of the region (a window can straddle two monitors).
+        guard let displayIndex = ScreenGeometry.bestMatchIndex(for: quartzRect, in: displays.map(\.frame)) else {
+            throw NSError(domain: "ScreenLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "No display found for the requested region"])
+        }
+        let display = displays[displayIndex]
+
+        let clampedQuartz = quartzRect.intersection(display.frame).integral.intersection(display.frame)
+        guard !clampedQuartz.isNull, clampedQuartz.width > 32, clampedQuartz.height > 32 else {
             throw NSError(domain: "ScreenLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Capture region outside screen bounds"])
         }
-
-        let screen = screenContaining(quartzRect: clampedQuartz)
-        let scale = screen.backingScaleFactor
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
         let excludedWindows = content.windows.filter { $0.owningApplication?.processID == ownPID }
@@ -1077,22 +1208,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
         let config = SCStreamConfiguration()
 
+        // sourceRect is relative to the display's own top-left, in points.
         let localRect = CGRect(
             x: clampedQuartz.origin.x - display.frame.origin.x,
             y: clampedQuartz.origin.y - display.frame.origin.y,
             width: clampedQuartz.width,
             height: clampedQuartz.height
         )
+        let scale = pointPixelScale(for: filter, display: display)
+        let pixels = ScreenGeometry.pixelSize(forPointSize: localRect.size, scale: scale)
+
         config.sourceRect = localRect
-        config.width = Int(localRect.width * scale)
-        config.height = Int(localRect.height * scale)
+        config.width = pixels.width
+        config.height = pixels.height
+        config.captureResolution = .best   // never let the system downscale the capture
         config.showsCursor = false
 
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        return (image, clampedQuartz)
+        let actualScale = clampedQuartz.width > 0 ? CGFloat(image.width) / clampedQuartz.width : scale
+        return CapturedRegion(image: image, quartzRect: clampedQuartz, pointPixelScale: actualScale)
     }
 
     // MARK: - Best-Model Multi-Scale Vision OCR (Tiny Footnotes + Oversized Headlines)
+    //
+    // Which passes run is decided by `OCRPlanner` (see ScreenLensCore) from the capture's real pixel size
+    // and the display's pixels-per-point, not from hardcoded 1440x900-era thresholds.
 
     nonisolated private static func configureBestTextRequest(_ request: VNRecognizeTextRequest, minimumTextHeight: Float) {
         if let latestRevision = VNRecognizeTextRequest.supportedRevisions.max() {
@@ -1104,156 +1244,81 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         request.minimumTextHeight = minimumTextHeight
     }
 
-    nonisolated func performMultiScaleOCR(on cgImage: CGImage) async throws -> [TextItem] {
+    /// Crops the pass region out of the native-resolution capture and scales it as the plan asks.
+    nonisolated private static func renderPass(_ pass: OCRPassSpec, from image: CGImage) -> CGImage? {
+        let coversWholeImage = pass.crop.width >= CGFloat(image.width) && pass.crop.height >= CGFloat(image.height)
+        let base: CGImage
+        if coversWholeImage {
+            base = image
+        } else {
+            guard let cropped = image.cropping(to: pass.crop) else { return nil }
+            base = cropped
+        }
+        return resizeCGImage(base, scale: pass.outputScale) ?? base
+    }
+
+    /// Runs Vision synchronously and returns its observations. (Reading `results` after `perform` avoids the
+    /// completion-handler + thrown-error double-resume hazard of the previous continuation-based code.)
+    nonisolated private static func recognizeText(in image: CGImage, minimumTextHeight: Float) throws -> [VNRecognizedTextObservation] {
+        let request = VNRecognizeTextRequest()
+        configureBestTextRequest(request, minimumTextHeight: minimumTextHeight)
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        try handler.perform([request])
+        return (request.results as? [VNRecognizedTextObservation]) ?? []
+    }
+
+    nonisolated func performMultiScaleOCR(on cgImage: CGImage, pointPixelScale: CGFloat) async throws -> [TextItem] {
+        let passes = OCRPlanner.translationPasses(
+            pixelWidth: cgImage.width,
+            pixelHeight: cgImage.height,
+            pointPixelScale: pointPixelScale
+        )
+
         var combined: [TextItem] = []
-
-        // Pass 1: High-sensitivity pass for small & medium body text
-        let maxDim = max(cgImage.width, cgImage.height)
-        let smallUpscale: CGFloat = maxDim < 1800 ? 1.5 : 1.15
-        let pass1Image = Self.resizeCGImage(cgImage, scale: smallUpscale) ?? cgImage
-        let pass1Items = try await runSingleTextPass(on: pass1Image, minimumTextHeight: 0.0035)
-        combined.append(contentsOf: pass1Items)
-
-        // Pass 2: Downscaled pass on large captures so oversized display headings don't fragment
-        if maxDim > 1600 {
-            let downscale = 1400.0 / CGFloat(maxDim)
-            if let pass2Image = Self.resizeCGImage(cgImage, scale: downscale) {
-                let pass2Items = try await runSingleTextPass(on: pass2Image, minimumTextHeight: 0.024)
-                combined.append(contentsOf: pass2Items)
+        for pass in passes {
+            guard let passImage = Self.renderPass(pass, from: cgImage) else { continue }
+            let observations = try Self.recognizeText(in: passImage, minimumTextHeight: pass.minimumTextHeight)
+            for obs in observations {
+                guard let candidate = obs.topCandidates(1).first else { continue }
+                let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                let box = pass.mapToFullImage(obs.boundingBox, imageWidth: cgImage.width, imageHeight: cgImage.height)
+                combined.append(TextItem(
+                    text: text,
+                    boundingBox: box,
+                    avgLineHeight: box.height,
+                    confidence: candidate.confidence
+                ))
             }
         }
 
-        return deduplicateTextItems(combined, iouThreshold: 0.55)
-    }
-
-    nonisolated private func runSingleTextPass(on cgImage: CGImage, minimumTextHeight: Float) async throws -> [TextItem] {
-        try await withCheckedThrowingContinuation { continuation in
-            let request = VNRecognizeTextRequest { request, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                let observations = request.results as? [VNRecognizedTextObservation] ?? []
-                let items: [TextItem] = observations.compactMap { obs in
-                    guard let candidate = obs.topCandidates(1).first else { return nil }
-                    let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !text.isEmpty else { return nil }
-                    return TextItem(
-                        text: text,
-                        boundingBox: obs.boundingBox,
-                        avgLineHeight: obs.boundingBox.height,
-                        confidence: candidate.confidence
-                    )
-                }
-                continuation.resume(returning: items)
-            }
-            Self.configureBestTextRequest(request, minimumTextHeight: minimumTextHeight)
-
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            do {
-                try handler.perform([request])
-            } catch {
-                continuation.resume(throwing: error)
-            }
-        }
-    }
-
-    nonisolated private func deduplicateTextItems(_ items: [TextItem], iouThreshold: CGFloat) -> [TextItem] {
-        let sorted = items.sorted {
-            if abs($0.confidence - $1.confidence) > 0.08 {
-                return $0.confidence > $1.confidence
-            }
-            return $0.text.count > $1.text.count
-        }
-        var kept: [TextItem] = []
-        for item in sorted {
-            let dup = kept.contains { existing in
-                Self.iou(existing.boundingBox, item.boundingBox) > iouThreshold
-            }
-            if !dup {
-                kept.append(item)
-            }
-        }
-        return kept
+        return OCRDedupe.deduplicate(combined, iouThreshold: 0.55)
     }
 
     // MARK: - Multi-Scale Word Extraction for Select & Search (⌥⌘S)
 
-    nonisolated func extractWordsMultiScale(from cgImage: CGImage) async throws -> [WordBox] {
-        let width = CGFloat(cgImage.width)
-        let height = CGFloat(cgImage.height)
-        let maxDim = max(width, height)
-        var allWords: [WordBox] = []
-
-        // Pass 1A: Ultra-macro pass so giant hero banners (100pt-240pt) are detected as whole words
-        if maxDim > 1400 {
-            let ultraMacroScale = 1100.0 / maxDim
-            if let ultraMacroImage = Self.resizeCGImage(cgImage, scale: ultraMacroScale) {
-                let heroWords = try await extractWordsFromTile(
-                    tileImage: ultraMacroImage,
-                    tileNormRect: CGRect(x: 0, y: 0, width: 1, height: 1),
-                    minimumTextHeight: 0.035
-                )
-                allWords.append(contentsOf: heroWords)
-            }
-        }
-
-        // Pass 1B: Standard full-screen pass for medium/large headings & body text
-        let macroScale: CGFloat = maxDim > 2200 ? (1900.0 / maxDim) : 1.0
-        let macroImage = Self.resizeCGImage(cgImage, scale: macroScale) ?? cgImage
-        let macroWords = try await extractWordsFromTile(
-            tileImage: macroImage,
-            tileNormRect: CGRect(x: 0, y: 0, width: 1, height: 1),
-            minimumTextHeight: 0.011
+    nonisolated func extractWordsMultiScale(from cgImage: CGImage, pointPixelScale: CGFloat) async throws -> [WordBox] {
+        // giant (hero banners) + large + macro (headings, body) + overlapping upscaled tiles (tiny text)
+        let passes = OCRPlanner.wordSearchPasses(
+            pixelWidth: cgImage.width,
+            pixelHeight: cgImage.height,
+            pointPixelScale: pointPixelScale
         )
-        allWords.append(contentsOf: macroWords)
 
-        // Pass 2: Overlapping 2x2 upscaled grid so tiny 6pt-11pt text on any screen size is detected cleanly
-        let overlap: CGFloat = 0.08
-        let quadrantsTopLeft: [CGRect] = [
-            CGRect(x: 0, y: 0, width: width * (0.5 + overlap), height: height * (0.5 + overlap)),
-            CGRect(x: width * (0.5 - overlap), y: 0, width: width * (0.5 + overlap), height: height * (0.5 + overlap)),
-            CGRect(x: 0, y: height * (0.5 - overlap), width: width * (0.5 + overlap), height: height * (0.5 + overlap)),
-            CGRect(x: width * (0.5 - overlap), y: height * (0.5 - overlap), width: width * (0.5 + overlap), height: height * (0.5 + overlap))
-        ]
-
-        let microUpscale: CGFloat = maxDim >= 3200 ? 1.5 : 2.0
-
-        for pixelCrop in quadrantsTopLeft {
-            let integralCrop = pixelCrop.integral
-            guard let cropped = cgImage.cropping(to: integralCrop) else { continue }
-
-            let normX = integralCrop.origin.x / width
-            let normW = integralCrop.width / width
-            let normH = integralCrop.height / height
-            let normY = 1.0 - ((integralCrop.origin.y + integralCrop.height) / height)
-            let tileNormRect = CGRect(x: normX, y: normY, width: normW, height: normH)
-
-            let upscaledTile = Self.resizeCGImage(cropped, scale: microUpscale) ?? cropped
-            let tileWords = try await extractWordsFromTile(
-                tileImage: upscaledTile,
-                tileNormRect: tileNormRect,
-                minimumTextHeight: 0.003
-            )
-            allWords.append(contentsOf: tileWords)
+        var allWords: [WordBox] = []
+        for pass in passes {
+            guard let passImage = Self.renderPass(pass, from: cgImage) else { continue }
+            let observations = try Self.recognizeText(in: passImage, minimumTextHeight: pass.minimumTextHeight)
+            allWords.append(contentsOf: Self.wordBoxes(
+                from: observations,
+                pass: pass,
+                imageWidth: cgImage.width,
+                imageHeight: cgImage.height
+            ))
         }
 
-        // Deduplicate overlapping words across macro + 2x2 micro passes
-        let sortedByConf = allWords.sorted {
-            if abs($0.confidence - $1.confidence) > 0.08 {
-                return $0.confidence > $1.confidence
-            }
-            return $0.word.count > $1.word.count
-        }
-        var uniqueWords: [WordBox] = []
-        for candidate in sortedByConf {
-            let isDup = uniqueWords.contains { existing in
-                Self.iou(existing.rect, candidate.rect) > 0.45
-            }
-            if !isDup {
-                uniqueWords.append(candidate)
-            }
-        }
+        // Deduplicate across passes (same word at several scales, or a word cut by a tile edge)
+        let uniqueWords = OCRDedupe.deduplicate(allWords, iouThreshold: 0.45)
 
         // Sort in natural reading order (top-to-bottom, left-to-right)
         return uniqueWords.sorted { a, b in
@@ -1265,91 +1330,70 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    nonisolated private func extractWordsFromTile(
-        tileImage: CGImage,
-        tileNormRect: CGRect,
-        minimumTextHeight: Float
-    ) async throws -> [WordBox] {
-        try await withCheckedThrowingContinuation { continuation in
-            let request = VNRecognizeTextRequest { request, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                var rawWords: [WordBox] = []
-                let observations = request.results as? [VNRecognizedTextObservation] ?? []
-                let tokenizer = NLTokenizer(unit: .word)
+    /// Splits each recognized line into word boxes (NLTokenizer so CJK segments too) in full-image normalized space.
+    nonisolated private static func wordBoxes(
+        from observations: [VNRecognizedTextObservation],
+        pass: OCRPassSpec,
+        imageWidth: Int,
+        imageHeight: Int
+    ) -> [WordBox] {
+        var rawWords: [WordBox] = []
+        let tokenizer = NLTokenizer(unit: .word)
 
-                for obs in observations {
-                    guard let recognized = obs.topCandidates(1).first else { continue }
-                    let full = recognized.string
-                    let totalCount = max(full.count, 1)
-                    let lineBox = obs.boundingBox
+        for obs in observations {
+            guard let recognized = obs.topCandidates(1).first else { continue }
+            let full = recognized.string
+            let totalCount = max(full.count, 1)
+            let lineBox = obs.boundingBox
 
-                    // Use NLTokenizer so both space-delimited (English) and continuous (CJK) scripts segment into true words
-                    tokenizer.string = full
-                    var tokenRanges: [Range<String.Index>] = []
-                    tokenizer.enumerateTokens(in: full.startIndex..<full.endIndex) { range, _ in
-                        tokenRanges.append(range)
-                        return true
-                    }
-
-                    // Fallback to whitespace splitting if NLTokenizer yields no word tokens (e.g., pure symbols/codes)
-                    if tokenRanges.isEmpty {
-                        var searchStart = full.startIndex
-                        while searchStart < full.endIndex {
-                            while searchStart < full.endIndex && full[searchStart].isWhitespace {
-                                searchStart = full.index(after: searchStart)
-                            }
-                            if searchStart >= full.endIndex { break }
-                            var wordEnd = searchStart
-                            while wordEnd < full.endIndex && !full[wordEnd].isWhitespace {
-                                wordEnd = full.index(after: wordEnd)
-                            }
-                            tokenRanges.append(searchStart..<wordEnd)
-                            searchStart = wordEnd
-                        }
-                    }
-
-                    for range in tokenRanges {
-                        let word = String(full[range]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !word.isEmpty else { continue }
-
-                        let localBox: CGRect
-                        if let box = try? recognized.boundingBox(for: range),
-                           box.boundingBox.width > 0.0005, box.boundingBox.height > 0.0005 {
-                            localBox = box.boundingBox
-                        } else {
-                            let startOffset = CGFloat(full.distance(from: full.startIndex, to: range.lowerBound)) / CGFloat(totalCount)
-                            let endOffset = CGFloat(full.distance(from: full.startIndex, to: range.upperBound)) / CGFloat(totalCount)
-                            localBox = CGRect(
-                                x: lineBox.origin.x + lineBox.width * startOffset,
-                                y: lineBox.origin.y,
-                                width: max(lineBox.width * (endOffset - startOffset), 0.004),
-                                height: lineBox.height
-                            )
-                        }
-
-                        let globalBox = CGRect(
-                            x: tileNormRect.origin.x + localBox.origin.x * tileNormRect.width,
-                            y: tileNormRect.origin.y + localBox.origin.y * tileNormRect.height,
-                            width: localBox.width * tileNormRect.width,
-                            height: localBox.height * tileNormRect.height
-                        )
-                        rawWords.append(WordBox(word: word, rect: globalBox, confidence: recognized.confidence))
-                    }
-                }
-                continuation.resume(returning: rawWords)
+            tokenizer.string = full
+            var tokenRanges: [Range<String.Index>] = []
+            tokenizer.enumerateTokens(in: full.startIndex..<full.endIndex) { range, _ in
+                tokenRanges.append(range)
+                return true
             }
-            Self.configureBestTextRequest(request, minimumTextHeight: minimumTextHeight)
 
-            let handler = VNImageRequestHandler(cgImage: tileImage, options: [:])
-            do {
-                try handler.perform([request])
-            } catch {
-                continuation.resume(throwing: error)
+            // Fallback to whitespace splitting if NLTokenizer yields no word tokens (e.g., pure symbols/codes)
+            if tokenRanges.isEmpty {
+                var searchStart = full.startIndex
+                while searchStart < full.endIndex {
+                    while searchStart < full.endIndex && full[searchStart].isWhitespace {
+                        searchStart = full.index(after: searchStart)
+                    }
+                    if searchStart >= full.endIndex { break }
+                    var wordEnd = searchStart
+                    while wordEnd < full.endIndex && !full[wordEnd].isWhitespace {
+                        wordEnd = full.index(after: wordEnd)
+                    }
+                    tokenRanges.append(searchStart..<wordEnd)
+                    searchStart = wordEnd
+                }
+            }
+
+            for range in tokenRanges {
+                let word = String(full[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !word.isEmpty else { continue }
+
+                let localBox: CGRect
+                if let box = try? recognized.boundingBox(for: range),
+                   box.boundingBox.width > 0.0005, box.boundingBox.height > 0.0005 {
+                    localBox = box.boundingBox
+                } else {
+                    let startOffset = CGFloat(full.distance(from: full.startIndex, to: range.lowerBound)) / CGFloat(totalCount)
+                    let endOffset = CGFloat(full.distance(from: full.startIndex, to: range.upperBound)) / CGFloat(totalCount)
+                    localBox = CGRect(
+                        x: lineBox.origin.x + lineBox.width * startOffset,
+                        y: lineBox.origin.y,
+                        width: max(lineBox.width * (endOffset - startOffset), 0.004),
+                        height: lineBox.height
+                    )
+                }
+
+                let globalBox = pass.mapToFullImage(localBox, imageWidth: imageWidth, imageHeight: imageHeight)
+                rawWords.append(WordBox(word: word, rect: globalBox, confidence: recognized.confidence))
             }
         }
+        return rawWords
     }
 
     nonisolated private static func resizeCGImage(_ image: CGImage, scale: CGFloat) -> CGImage? {
@@ -1361,14 +1405,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         filter.setValue(1.0, forKey: kCIInputAspectRatioKey)
         guard let output = filter.outputImage else { return nil }
         return sharedCIContext.createCGImage(output, from: output.extent)
-    }
-
-    nonisolated private static func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
-        let inter = a.intersection(b)
-        if inter.isNull { return 0 }
-        let interArea = inter.width * inter.height
-        let unionArea = (a.width * a.height) + (b.width * b.height) - interArea
-        return unionArea > 0 ? interArea / unionArea : 0
     }
 
     // MARK: - Column-Aware Paragraph Clustering
@@ -1688,7 +1724,8 @@ class TranslationOverlayView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let screenMinFont = max(6.0, bounds.height * 0.007)
+        // Fixed minimum in points: scaling it with the region height made text overflow on large displays.
+        let screenMinFont: CGFloat = 7.0
         let screenMaxFont = min(max(bounds.height * 0.085, 24.0), 72.0)
 
         for block in blocks {

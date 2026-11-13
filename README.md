@@ -61,10 +61,15 @@ Grant Screen Recording and Accessibility when prompted. The menu bar icon shows 
 - Launch at Login toggle (requires the app to be in `/Applications`)
 - App stays running in the menu bar until you quit
 
+## How screen size and content detection work
+
+- **Any display, any scale.** The capture is taken from the display that holds most of the target region (a window can straddle two monitors) at that display's real pixels-per-point (ScreenCaptureKit `pointPixelScale`, Retina, "More Space" scaled modes and 1x externals). Quartz (top-left) and AppKit (bottom-left) coordinates are converted relative to the primary display, so monitors placed left/right/above/below work.
+- **Translate main content (⌥⌘T).** Order of preference: (1) the focused window's `AXWebArea` (browsers/Electron) or main `AXScrollArea` (document apps), which already excludes the menu bar, tabs, URL bar and bookmarks bar; (2) the window minus the measured bottom of its `AXToolbar` / tab strip; (3) the window minus a heuristic title-bar/toolbar margin capped at 24% of the window height (also used without Accessibility permission); (4) the active display's usable area (below the menu bar/notch, above the Dock). Text-block filters use points, not fractions of the capture, so they behave the same on every screen size.
+- **Select & search (⌥⌘S).** Several OCR passes run on the native-resolution capture: overlapping upscaled tiles for tiny text, a full-size pass for body text/headings, and downscaled passes for large and giant hero text. Duplicates across passes are merged.
+- The platform-independent logic lives in `Sources/ScreenLensCore` and is unit tested: `swift test` (works on macOS and Linux).
+
 ## Notes
 
 - Translation assumes English source and requires macOS 26+ for the direct TranslationSession API. Language packs must be pre-installed.
-- Overlay positioning converts between Quartz (top-left) and AppKit (bottom-left) coordinates.
-- Multi-monitor support is basic (uses main screen for some operations).
 - Word selection works best on clear, high-contrast text.
-- Accessibility permission is required for active-window translation. Without it, use ⌥⌘A to drag a region.
+- Accessibility permission gives the most exact content area. Without it ScreenLens falls back to window bounds plus a heuristic margin; use ⌥⌘A to drag a region when the result is off.
