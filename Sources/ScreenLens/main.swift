@@ -2,6 +2,7 @@ import AppKit
 import HotKey
 import Vision
 import Translation
+import NaturalLanguage
 import ScreenCaptureKit
 import ApplicationServices
 import ServiceManagement
@@ -49,11 +50,13 @@ final class FloatingPanel: NSPanel {
     }
 }
 
-// MARK: - App Delegate (Menu Bar Tool)
+// MARK: - App Delegate (Menu Bar & CLI Daemon)
 
 @available(macOS 14.0, *)
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    static let cliCommandNotification = Notification.Name("com.screenlens.app.cliCommand")
+
     var statusItem: NSStatusItem!
     var translateHotKey: HotKey?
     var areaTranslateHotKey: HotKey?
@@ -65,6 +68,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var inputMonitors: [Any] = []
     var isTranslating = false
     var recentHistory: [(source: String, target: String)] = []
+    var initialCLICommand: String?
 
     /// Remembers the last frontmost non-ScreenLens app PID
     var lastActiveAppPID: pid_t?
@@ -73,6 +77,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screenStatusItem: NSMenuItem!
     private var historySubmenu: NSMenu!
     private var launchAtLoginItem: NSMenuItem!
+
+    nonisolated private static let sharedCIContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .cacheIntermediates: false
+    ])
 
     private let browserBundleIDs: Set<String> = [
         "com.apple.Safari",
@@ -114,6 +123,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        // Listen for CLI commands forwarded from secondary invocations (e.g., `screenlens --translate`)
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleCLIDistributedCommand(_:)),
+            name: Self.cliCommandNotification,
+            object: nil
+        )
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "text.viewfinder", accessibilityDescription: "ScreenLens")
@@ -122,6 +139,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         setupMenu()
         setupHotKeys()
+
+        if let cmd = initialCLICommand {
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                self.dispatchCLICommand(cmd)
+            }
+        }
+    }
+
+    @objc private func handleCLIDistributedCommand(_ note: Notification) {
+        guard let cmd = note.userInfo?["command"] as? String else { return }
+        dispatchCLICommand(cmd)
+    }
+
+    private func dispatchCLICommand(_ cmd: String) {
+        switch cmd {
+        case "--translate", "-t":
+            translateScreen()
+        case "--area", "-a":
+            translateSelectedArea()
+        case "--search", "-s":
+            selectAndSearch()
+        case "--clear", "-c":
+            clearOverlayAction()
+        default:
+            break
+        }
     }
 
     // MARK: - Menu Bar UI Construction
@@ -355,7 +399,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Universal Multi-Screen Coordinate Conversion (Quartz Top-Left <-> AppKit Bottom-Left)
 
     private func primaryScreenHeight() -> CGFloat {
-        // Primary display in Quartz is always the screen anchored at AppKit (0,0)
+        // Quartz global origin (0,0) is always anchored at the top-left of the screen at AppKit (0,0)
         return NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
             ?? NSScreen.screens.first?.frame.height
             ?? 1080
@@ -383,7 +427,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func screenContaining(quartzRect: CGRect) -> NSScreen {
         let appKitRect = quartzToAppKit(quartzRect)
-        // Pick the screen with the largest intersection area (handles windows straddling monitors)
         var bestScreen: NSScreen?
         var bestArea: CGFloat = 0
         for screen in NSScreen.screens {
@@ -404,6 +447,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) })
             ?? NSScreen.main
             ?? NSScreen.screens[0]
+    }
+
+    /// Returns the safe usable AppKit rect for any Mac screen (excluding Menu Bar, Notch, and Dock)
+    private func safeUsableAppKitFrame(for screen: NSScreen) -> CGRect {
+        var usable = screen.visibleFrame
+        let topNotchInset = screen.safeAreaInsets.top
+        if topNotchInset > 0 {
+            let maxSafeY = screen.frame.maxY - topNotchInset
+            if usable.maxY > maxSafeY {
+                usable.size.height = max(0, maxSafeY - usable.origin.y)
+            }
+        }
+        return usable
     }
 
     // MARK: - 1. Translate Active Window Main Content (⌥⌘T)
@@ -529,15 +585,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
 
-        // Manual area selection (⌥⌘A): respect almost everything the user explicitly dragged over
+        // Manual area selection (⌥⌘A): respect everything the user explicitly dragged over
         if !isMainContentMode {
             return trimmed.count >= 2 || trimmed.containsCJK
         }
 
         let box = item.boundingBox
 
-        // Drop extreme left/right window border artifacts (scrollbars, window edges)
-        if box.minX < 0.012 || box.maxX > 0.988 { return false }
+        // Drop extreme left/right window border artifacts (scrollbars, resize handles)
+        if box.minX < 0.01 || box.maxX > 0.99 { return false }
 
         // Require minimum meaningful characters (CJK needs fewer chars than Latin)
         if trimmed.containsCJK {
@@ -551,16 +607,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
 
+        // Ignore narrow single-line edge navigation/sidebar rails on wide windows
+        let isSingleLineHeight = box.height < 0.032
+        if isSingleLineHeight && box.width < 0.14 && (box.maxX < 0.16 || box.minX > 0.84) {
+            return false
+        }
+
         // If AXWebArea / AXScrollArea wasn't available, filter residual top browser/toolbar chrome
         let exactAX = targetInfo?.isExactContentArea ?? false
         let isBrowser = targetInfo?.isBrowserWindow ?? false
 
         if !exactAX {
-            // Distance from top of captured region in points
             let distFromTopPts = (1.0 - box.maxY) * regionHeightPts
 
             // Filter URL bar strings near the top edge
-            if distFromTopPts < 95 {
+            if distFromTopPts < 110 {
                 let urlRegex = #"^(https?://|www\.|localhost(:\d+)?|[a-zA-Z0-9-]+(\.[a-zA-Z]{2,})+(/.*)?)$"#
                 if trimmed.range(of: urlRegex, options: .regularExpression) != nil {
                     return false
@@ -568,7 +629,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             // Filter narrow single-line browser tab titles / bookmark items in the top chrome strip
-            if isBrowser && distFromTopPts < 76 && box.width < 0.24 && box.height < 0.03 {
+            if isBrowser && distFromTopPts < 88 && box.width < 0.28 && box.height < 0.032 {
                 return false
             }
         }
@@ -672,13 +733,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             let actualAppKitFrame = quartzToAppKit(actualQuartzRect)
-            showWordSelectionOverlay(words: words, screenFrame: actualAppKitFrame)
+            let topSafeInset = max(screen.safeAreaInsets.top, 0)
+            showWordSelectionOverlay(words: words, screenFrame: actualAppKitFrame, topSafeInset: topSafeInset)
         } catch {
             showAlert("Failed to start word selection: \(error.localizedDescription)")
         }
     }
 
-    func showWordSelectionOverlay(words: [WordBox], screenFrame: CGRect) {
+    func showWordSelectionOverlay(words: [WordBox], screenFrame: CGRect, topSafeInset: CGFloat) {
         closeSelectionWindow()
 
         let window = FloatingPanel(
@@ -696,7 +758,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.hasShadow = false
         window.isReleasedWhenClosed = false
 
-        let view = WordSelectionView(words: words, frame: NSRect(origin: .zero, size: screenFrame.size))
+        let view = WordSelectionView(
+            words: words,
+            frame: NSRect(origin: .zero, size: screenFrame.size),
+            topSafeInset: topSafeInset
+        )
         view.onComplete = { [weak self] selectedText in
             Task { @MainActor in
                 self?.closeSelectionWindow()
@@ -748,7 +814,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let bundleID = targetApp?.bundleIdentifier ?? ""
         let isBrowser = browserBundleIDs.contains(bundleID)
 
-        // 1. Accessibility Lookup: Find exact AXWebArea (browsers) or primary AXScrollArea (document apps)
+        // 1. Accessibility Lookup: Exact AXWebArea (browsers) or primary AXScrollArea (document apps)
         if let pid = effectivePID, pid != ownPID, AXIsProcessTrusted() {
             let appElement = AXUIElementCreateApplication(pid)
             AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, true as CFBoolean)
@@ -759,15 +825,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                windowRect.width > 120, windowRect.height > 100 {
 
                 let screen = screenContaining(quartzRect: windowRect)
-                let visibleQuartz = appKitToQuartz(screen.visibleFrame)
-                let clampedWindow = windowRect.intersection(visibleQuartz)
+                let usableQuartz = appKitToQuartz(safeUsableAppKitFrame(for: screen))
+                let clampedWindow = windowRect.intersection(usableQuartz)
 
-                // A. Try AXWebArea first (Safari, Chrome, Arc, Brave, Edge, Firefox, Orion, Vivaldi)
+                // A. Try AXWebArea first (automatically excludes macOS menu bar, tabs, URL bar, and bookmarks bar)
                 if let webArea = findLargestElement(
                     matchingRoles: ["AXWebArea"],
                     root: windowElement,
                     within: clampedWindow,
-                    maxDepth: 12
+                    maxDepth: 14
                 ), let webRect = frameOfAXElement(webArea) {
                     let exact = webRect.intersection(clampedWindow)
                     if exact.width > 120 && exact.height > 100 {
@@ -785,7 +851,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     matchingRoles: ["AXScrollArea"],
                     root: windowElement,
                     within: clampedWindow,
-                    maxDepth: 7
+                    maxDepth: 8
                    ),
                    let scrollRect = frameOfAXElement(scrollArea) {
                     let exact = scrollRect.intersection(clampedWindow)
@@ -815,8 +881,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 2. WindowServer Fallback (CGWindowListCopyWindowInfo)
         if let rawWindowRect = findWindowServerRect(targetPID: effectivePID, ownPID: ownPID) {
             let screen = screenContaining(quartzRect: rawWindowRect)
-            let visibleQuartz = appKitToQuartz(screen.visibleFrame)
-            let clampedWindow = rawWindowRect.intersection(visibleQuartz)
+            let usableQuartz = appKitToQuartz(safeUsableAppKitFrame(for: screen))
+            let clampedWindow = rawWindowRect.intersection(usableQuartz)
 
             if !clampedWindow.isNull && clampedWindow.width > 120 && clampedWindow.height > 100 {
                 let trimmed = trimWindowChrome(
@@ -832,30 +898,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        // 3. Ultimate Fallback: Active screen's visibleFrame (already excludes macOS Menu Bar, Notch & Dock)
+        // 3. Ultimate Fallback: Active screen's safe usable frame (excludes Menu Bar, Notch & Dock)
         let screen = currentMouseScreen()
-        let visibleQuartz = appKitToQuartz(screen.visibleFrame)
+        let usableQuartz = appKitToQuartz(safeUsableAppKitFrame(for: screen))
         return ActiveContentTarget(
-            quartzRect: visibleQuartz,
+            quartzRect: usableQuartz,
             isExactContentArea: false,
             isBrowserWindow: isBrowser
         )
     }
 
     private func trimWindowChrome(windowQuartzRect: CGRect, isBrowser: Bool, bundleID: String) -> CGRect {
-        var topInset: CGFloat = isBrowser ? 108.0 : 52.0
+        // Covers title/tab bar (~40pt) + address/URL bar (~42pt) + bookmarks bar (~32pt)
+        var topInset: CGFloat = isBrowser ? 114.0 : 52.0
         var leftInset: CGFloat = 0.0
 
         // Arc uses a left sidebar + slim top URL bar rather than tall top tabs + bookmarks
         if bundleID == "company.thebrowser.Browser" {
-            topInset = 22.0
+            topInset = 24.0
             if windowQuartzRect.width > 920 {
-                leftInset = 210.0
+                leftInset = 215.0
             }
         }
 
-        // Never trim more than 25% of the window height on compact windows
-        topInset = min(topInset, windowQuartzRect.height * 0.25)
+        // Never trim more than 24% of the window height on compact windows
+        topInset = min(topInset, windowQuartzRect.height * 0.24)
 
         return CGRect(
             x: windowQuartzRect.origin.x + leftInset,
@@ -1025,23 +1092,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (image, clampedQuartz)
     }
 
-    // MARK: - Multi-Scale Vision OCR (Detects Both Tiny Footnotes & Oversized Headlines)
+    // MARK: - Best-Model Multi-Scale Vision OCR (Tiny Footnotes + Oversized Headlines)
+
+    nonisolated private static func configureBestTextRequest(_ request: VNRecognizeTextRequest, minimumTextHeight: Float) {
+        if let latestRevision = VNRecognizeTextRequest.supportedRevisions.max() {
+            request.revision = latestRevision
+        }
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.automaticallyDetectsLanguage = true
+        request.minimumTextHeight = minimumTextHeight
+    }
 
     nonisolated func performMultiScaleOCR(on cgImage: CGImage) async throws -> [TextItem] {
         var combined: [TextItem] = []
 
         // Pass 1: High-sensitivity pass for small & medium body text
-        let smallUpscale: CGFloat = max(cgImage.width, cgImage.height) < 1800 ? 1.5 : 1.15
+        let maxDim = max(cgImage.width, cgImage.height)
+        let smallUpscale: CGFloat = maxDim < 1800 ? 1.5 : 1.15
         let pass1Image = Self.resizeCGImage(cgImage, scale: smallUpscale) ?? cgImage
-        let pass1Items = try await runSingleTextPass(on: pass1Image, minimumTextHeight: 0.004)
+        let pass1Items = try await runSingleTextPass(on: pass1Image, minimumTextHeight: 0.0035)
         combined.append(contentsOf: pass1Items)
 
         // Pass 2: Downscaled pass on large captures so oversized display headings don't fragment
-        let maxDim = max(cgImage.width, cgImage.height)
-        if maxDim > 1800 {
-            let downscale = 1600.0 / CGFloat(maxDim)
+        if maxDim > 1600 {
+            let downscale = 1400.0 / CGFloat(maxDim)
             if let pass2Image = Self.resizeCGImage(cgImage, scale: downscale) {
-                let pass2Items = try await runSingleTextPass(on: pass2Image, minimumTextHeight: 0.022)
+                let pass2Items = try await runSingleTextPass(on: pass2Image, minimumTextHeight: 0.024)
                 combined.append(contentsOf: pass2Items)
             }
         }
@@ -1070,10 +1147,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 continuation.resume(returning: items)
             }
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-            request.automaticallyDetectsLanguage = true
-            request.minimumTextHeight = minimumTextHeight
+            Self.configureBestTextRequest(request, minimumTextHeight: minimumTextHeight)
 
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             do {
@@ -1108,21 +1182,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     nonisolated func extractWordsMultiScale(from cgImage: CGImage) async throws -> [WordBox] {
         let width = CGFloat(cgImage.width)
         let height = CGFloat(cgImage.height)
+        let maxDim = max(width, height)
         var allWords: [WordBox] = []
 
-        // Pass 1: Macro full-screen pass (downscaled if 4K/5K so giant banners & titles are captured whole)
-        let maxDim = max(width, height)
+        // Pass 1A: Ultra-macro pass so giant hero banners (100pt-240pt) are detected as whole words
+        if maxDim > 1400 {
+            let ultraMacroScale = 1100.0 / maxDim
+            if let ultraMacroImage = Self.resizeCGImage(cgImage, scale: ultraMacroScale) {
+                let heroWords = try await extractWordsFromTile(
+                    tileImage: ultraMacroImage,
+                    tileNormRect: CGRect(x: 0, y: 0, width: 1, height: 1),
+                    minimumTextHeight: 0.035
+                )
+                allWords.append(contentsOf: heroWords)
+            }
+        }
+
+        // Pass 1B: Standard full-screen pass for medium/large headings & body text
         let macroScale: CGFloat = maxDim > 2200 ? (1900.0 / maxDim) : 1.0
         let macroImage = Self.resizeCGImage(cgImage, scale: macroScale) ?? cgImage
         let macroWords = try await extractWordsFromTile(
             tileImage: macroImage,
             tileNormRect: CGRect(x: 0, y: 0, width: 1, height: 1),
-            minimumTextHeight: 0.012
+            minimumTextHeight: 0.011
         )
         allWords.append(contentsOf: macroWords)
 
-        // Pass 2: Overlapping 2x2 upscaled grid so tiny 7pt-12pt text on any screen size is detected cleanly
-        let overlap: CGFloat = 0.06
+        // Pass 2: Overlapping 2x2 upscaled grid so tiny 6pt-11pt text on any screen size is detected cleanly
+        let overlap: CGFloat = 0.08
         let quadrantsTopLeft: [CGRect] = [
             CGRect(x: 0, y: 0, width: width * (0.5 + overlap), height: height * (0.5 + overlap)),
             CGRect(x: width * (0.5 - overlap), y: 0, width: width * (0.5 + overlap), height: height * (0.5 + overlap)),
@@ -1130,13 +1217,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             CGRect(x: width * (0.5 - overlap), y: height * (0.5 - overlap), width: width * (0.5 + overlap), height: height * (0.5 + overlap))
         ]
 
-        let microUpscale: CGFloat = maxDim >= 3200 ? 1.35 : 1.75
+        let microUpscale: CGFloat = maxDim >= 3200 ? 1.5 : 2.0
 
         for pixelCrop in quadrantsTopLeft {
             let integralCrop = pixelCrop.integral
             guard let cropped = cgImage.cropping(to: integralCrop) else { continue }
 
-            // Convert CGImage top-left crop rect into Vision normalized bottom-left rect
             let normX = integralCrop.origin.x / width
             let normW = integralCrop.width / width
             let normH = integralCrop.height / height
@@ -1147,7 +1233,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let tileWords = try await extractWordsFromTile(
                 tileImage: upscaledTile,
                 tileNormRect: tileNormRect,
-                minimumTextHeight: 0.004
+                minimumTextHeight: 0.003
             )
             allWords.append(contentsOf: tileWords)
         }
@@ -1192,32 +1278,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 var rawWords: [WordBox] = []
                 let observations = request.results as? [VNRecognizedTextObservation] ?? []
+                let tokenizer = NLTokenizer(unit: .word)
+
                 for obs in observations {
                     guard let recognized = obs.topCandidates(1).first else { continue }
                     let full = recognized.string
                     let totalCount = max(full.count, 1)
                     let lineBox = obs.boundingBox
 
-                    var searchStart = full.startIndex
-                    while searchStart < full.endIndex {
-                        while searchStart < full.endIndex && full[searchStart].isWhitespace {
-                            searchStart = full.index(after: searchStart)
+                    // Use NLTokenizer so both space-delimited (English) and continuous (CJK) scripts segment into true words
+                    tokenizer.string = full
+                    var tokenRanges: [Range<String.Index>] = []
+                    tokenizer.enumerateTokens(in: full.startIndex..<full.endIndex) { range, _ in
+                        tokenRanges.append(range)
+                        return true
+                    }
+
+                    // Fallback to whitespace splitting if NLTokenizer yields no word tokens (e.g., pure symbols/codes)
+                    if tokenRanges.isEmpty {
+                        var searchStart = full.startIndex
+                        while searchStart < full.endIndex {
+                            while searchStart < full.endIndex && full[searchStart].isWhitespace {
+                                searchStart = full.index(after: searchStart)
+                            }
+                            if searchStart >= full.endIndex { break }
+                            var wordEnd = searchStart
+                            while wordEnd < full.endIndex && !full[wordEnd].isWhitespace {
+                                wordEnd = full.index(after: wordEnd)
+                            }
+                            tokenRanges.append(searchStart..<wordEnd)
+                            searchStart = wordEnd
                         }
-                        if searchStart >= full.endIndex { break }
-                        var wordEnd = searchStart
-                        while wordEnd < full.endIndex && !full[wordEnd].isWhitespace {
-                            wordEnd = full.index(after: wordEnd)
-                        }
-                        let range = searchStart..<wordEnd
-                        let word = String(full[range])
+                    }
+
+                    for range in tokenRanges {
+                        let word = String(full[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !word.isEmpty else { continue }
 
                         let localBox: CGRect
                         if let box = try? recognized.boundingBox(for: range),
                            box.boundingBox.width > 0.0005, box.boundingBox.height > 0.0005 {
                             localBox = box.boundingBox
                         } else {
-                            let startOffset = CGFloat(full.distance(from: full.startIndex, to: searchStart)) / CGFloat(totalCount)
-                            let endOffset = CGFloat(full.distance(from: full.startIndex, to: wordEnd)) / CGFloat(totalCount)
+                            let startOffset = CGFloat(full.distance(from: full.startIndex, to: range.lowerBound)) / CGFloat(totalCount)
+                            let endOffset = CGFloat(full.distance(from: full.startIndex, to: range.upperBound)) / CGFloat(totalCount)
                             localBox = CGRect(
                                 x: lineBox.origin.x + lineBox.width * startOffset,
                                 y: lineBox.origin.y,
@@ -1226,7 +1330,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             )
                         }
 
-                        // Map tile-local normalized box back to full-screen normalized box
                         let globalBox = CGRect(
                             x: tileNormRect.origin.x + localBox.origin.x * tileNormRect.width,
                             y: tileNormRect.origin.y + localBox.origin.y * tileNormRect.height,
@@ -1234,15 +1337,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             height: localBox.height * tileNormRect.height
                         )
                         rawWords.append(WordBox(word: word, rect: globalBox, confidence: recognized.confidence))
-                        searchStart = wordEnd
                     }
                 }
                 continuation.resume(returning: rawWords)
             }
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-            request.automaticallyDetectsLanguage = true
-            request.minimumTextHeight = minimumTextHeight
+            Self.configureBestTextRequest(request, minimumTextHeight: minimumTextHeight)
 
             let handler = VNImageRequestHandler(cgImage: tileImage, options: [:])
             do {
@@ -1261,8 +1360,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         filter.setValue(scale, forKey: kCIInputScaleKey)
         filter.setValue(1.0, forKey: kCIInputAspectRatioKey)
         guard let output = filter.outputImage else { return nil }
-        let context = CIContext(options: [.useSoftwareRenderer: false])
-        return context.createCGImage(output, from: output.extent)
+        return sharedCIContext.createCGImage(output, from: output.extent)
     }
 
     nonisolated private static func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
@@ -1379,30 +1477,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return first + " " + second
     }
 
-    // MARK: - Batch Translation
+    // MARK: - Auto-Detected Neural Batch Translation
+
+    nonisolated private static func detectLanguage(for text: String) -> Locale.Language {
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        if let dominant = recognizer.dominantLanguage, dominant != .undetermined {
+            return Locale.Language(identifier: dominant.rawValue)
+        }
+        return Locale.Language(identifier: "en")
+    }
 
     nonisolated func translateBatch(items: [TextItem], to target: String) async -> [TranslatedBlock] {
-        let source = Locale.Language(identifier: "en")
         let targetLang = Locale.Language(identifier: target)
 
         if #available(macOS 26.0, *) {
-            let session = TranslationSession(installedSource: source, target: targetLang)
-            let requests = items.enumerated().map { idx, item in
-                TranslationSession.Request(sourceText: item.text, clientIdentifier: "\(idx)")
+            // Group items by detected source language so multilingual pages translate accurately
+            var groupedIndices: [String: (source: Locale.Language, indices: [Int])] = [:]
+            var translatedByIndex: [Int: String] = [:]
+
+            for (idx, item) in items.enumerated() {
+                let detected = Self.detectLanguage(for: item.text)
+                // Skip blocks already in the exact target language/script
+                if detected.minimalIdentifier == targetLang.minimalIdentifier {
+                    translatedByIndex[idx] = item.text
+                    continue
+                }
+                let key = detected.minimalIdentifier
+                if var existing = groupedIndices[key] {
+                    existing.indices.append(idx)
+                    groupedIndices[key] = existing
+                } else {
+                    groupedIndices[key] = (source: detected, indices: [idx])
+                }
             }
-            if let responses = try? await session.translations(from: requests) {
-                var results: [TranslatedBlock] = []
-                for response in responses {
-                    if let idStr = response.clientIdentifier, let idx = Int(idStr), idx < items.count {
-                        results.append(TranslatedBlock(
-                            sourceText: items[idx].text,
-                            translatedText: response.targetText,
-                            boundingBox: items[idx].boundingBox,
-                            avgLineHeight: items[idx].avgLineHeight
-                        ))
+
+            for (_, group) in groupedIndices {
+                let session = TranslationSession(installedSource: group.source, target: targetLang)
+                let requests = group.indices.map { idx in
+                    TranslationSession.Request(sourceText: items[idx].text, clientIdentifier: "\(idx)")
+                }
+                if let responses = try? await session.translations(from: requests) {
+                    for response in responses {
+                        if let idStr = response.clientIdentifier, let idx = Int(idStr), idx < items.count {
+                            translatedByIndex[idx] = response.targetText
+                        }
                     }
                 }
-                if !results.isEmpty { return results }
+            }
+
+            if !translatedByIndex.isEmpty {
+                return items.enumerated().map { idx, item in
+                    TranslatedBlock(
+                        sourceText: item.text,
+                        translatedText: translatedByIndex[idx] ?? item.text,
+                        boundingBox: item.boundingBox,
+                        avgLineHeight: item.avgLineHeight
+                    )
+                }
             }
         }
 
@@ -1556,14 +1688,49 @@ class TranslationOverlayView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
+        let screenMinFont = max(6.0, bounds.height * 0.007)
+        let screenMaxFont = min(max(bounds.height * 0.085, 24.0), 72.0)
+
         for block in blocks {
-            let rawRect = convertVisionToFlippedView(block.boundingBox)
-            let coverRect = rawRect.intersection(bounds)
+            var coverRect = convertVisionToFlippedView(block.boundingBox).intersection(bounds)
             guard !coverRect.isNull, coverRect.width >= 8, coverRect.height >= 8 else { continue }
 
             let originalLineHeightPts = max(block.avgLineHeight * bounds.height, 6.0)
-            let cornerRadius = min(max(originalLineHeightPts * 0.25, 4.0), 10.0)
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .left
+            paragraph.lineBreakMode = .byWordWrapping
+            paragraph.lineSpacing = max(1.0, min(originalLineHeightPts * 0.08, 3.0))
 
+            let padX = min(max(coverRect.width * 0.015, 3.0), 8.0)
+            let padY = min(max(coverRect.height * 0.04, 1.5), 5.0)
+            var drawRect = coverRect.insetBy(dx: padX, dy: padY)
+            guard drawRect.width > 4, drawRect.height > 4 else { continue }
+
+            let (fontSize, requiredHeight) = optimalFontSize(
+                for: block.translatedText,
+                in: drawRect.size,
+                originalLineHeight: originalLineHeightPts,
+                minFont: screenMinFont,
+                maxCap: screenMaxFont,
+                paragraphStyle: paragraph
+            )
+
+            // Expand coverRect modestly (up to +18% / +14pt) if translated text is longer than source
+            if requiredHeight > drawRect.height {
+                let extraNeeded = min(requiredHeight - drawRect.height, max(coverRect.height * 0.18, 14.0))
+                let expanded = CGRect(
+                    x: coverRect.origin.x,
+                    y: coverRect.origin.y,
+                    width: coverRect.width,
+                    height: coverRect.height + extraNeeded
+                ).intersection(bounds)
+                if !expanded.isNull {
+                    coverRect = expanded
+                    drawRect = coverRect.insetBy(dx: padX, dy: padY)
+                }
+            }
+
+            let cornerRadius = min(max(originalLineHeightPts * 0.25, 4.0), 10.0)
             let path = NSBezierPath(roundedRect: coverRect, xRadius: cornerRadius, yRadius: cornerRadius)
             NSColor(calibratedWhite: 0.08, alpha: 0.92).setFill()
             path.fill()
@@ -1571,23 +1738,6 @@ class TranslationOverlayView: NSView {
             NSColor.white.withAlphaComponent(0.22).setStroke()
             path.lineWidth = 1.0
             path.stroke()
-
-            let padX = min(max(coverRect.width * 0.015, 3.0), 8.0)
-            let padY = min(max(coverRect.height * 0.04, 1.5), 5.0)
-            let drawRect = coverRect.insetBy(dx: padX, dy: padY)
-            guard drawRect.width > 4, drawRect.height > 4 else { continue }
-
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.alignment = .left
-            paragraph.lineBreakMode = .byWordWrapping
-            paragraph.lineSpacing = max(1.0, min(originalLineHeightPts * 0.08, 3.0))
-
-            let fontSize = optimalFontSize(
-                for: block.translatedText,
-                in: drawRect.size,
-                originalLineHeight: originalLineHeightPts,
-                paragraphStyle: paragraph
-            )
 
             let weight: NSFont.Weight = originalLineHeightPts >= 22.0 ? .semibold : .medium
             let attrs: [NSAttributedString.Key: Any] = [
@@ -1605,27 +1755,50 @@ class TranslationOverlayView: NSView {
         for text: String,
         in targetSize: NSSize,
         originalLineHeight: CGFloat,
+        minFont: CGFloat,
+        maxCap: CGFloat,
         paragraphStyle: NSParagraphStyle
-    ) -> CGFloat {
-        // Scale up to 72pt on large headlines / 4K-5K screens while shrinking cleanly for dense text
-        let maxFont = min(max(originalLineHeight * 0.92, 7.0), 72.0)
-        let minFont: CGFloat = 5.5
+    ) -> (size: CGFloat, height: CGFloat) {
+        let upper = min(max(originalLineHeight * 0.92, minFont), maxCap)
+        var low = minFont
+        var high = upper
+        var bestSize = minFont
+        var bestHeight: CGFloat = 0
 
-        for size in stride(from: maxFont, through: minFont, by: -0.5) {
+        let measureWidth = max(targetSize.width, 24)
+        for _ in 0..<10 {
+            let mid = (low + high) * 0.5
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: size, weight: .medium),
+                .font: NSFont.systemFont(ofSize: mid, weight: .medium),
                 .paragraphStyle: paragraphStyle
             ]
             let bound = (text as NSString).boundingRect(
-                with: NSSize(width: max(targetSize.width, 24), height: .greatestFiniteMagnitude),
+                with: NSSize(width: measureWidth, height: .greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 attributes: attrs
             )
-            if bound.height <= targetSize.height + 3.0 {
-                return size
+            if bound.height <= targetSize.height + 2.5 {
+                bestSize = mid
+                bestHeight = bound.height
+                low = mid
+            } else {
+                high = mid
             }
         }
-        return minFont
+
+        if bestHeight == 0 {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: minFont, weight: .medium),
+                .paragraphStyle: paragraphStyle
+            ]
+            bestHeight = (text as NSString).boundingRect(
+                with: NSSize(width: measureWidth, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: attrs
+            ).height
+        }
+
+        return (bestSize, bestHeight)
     }
 
     private func convertVisionToFlippedView(_ normalized: CGRect) -> CGRect {
@@ -1641,6 +1814,7 @@ class TranslationOverlayView: NSView {
 
 class WordSelectionView: NSView {
     let words: [WordBox]
+    let topSafeInset: CGFloat
     var onComplete: ((String?) -> Void)?
     var onCancel: (() -> Void)?
 
@@ -1655,8 +1829,9 @@ class WordSelectionView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    init(words: [WordBox], frame: NSRect) {
+    init(words: [WordBox], frame: NSRect, topSafeInset: CGFloat = 0) {
         self.words = words
+        self.topSafeInset = topSafeInset
         super.init(frame: frame)
     }
 
@@ -1738,8 +1913,9 @@ class WordSelectionView: NSView {
         ]
         let textSize = (bannerText as NSString).size(withAttributes: bannerAttrs)
         let pillWidth = min(max(textSize.width + 32, 320), bounds.width - 40)
-        // Offset y to 44pt so the pill never sits behind a MacBook notch
-        let pillRect = CGRect(x: (bounds.width - pillWidth) / 2, y: 44, width: pillWidth, height: 34)
+        // Clear both the macOS menu bar and any MacBook notch safeAreaInset
+        let pillY = max(44.0, topSafeInset + 14.0)
+        let pillRect = CGRect(x: (bounds.width - pillWidth) / 2, y: pillY, width: pillWidth, height: 34)
 
         let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 17, yRadius: 17)
         NSColor(calibratedWhite: 0.1, alpha: 0.90).setFill()
@@ -1770,7 +1946,7 @@ class WordSelectionView: NSView {
 
         for (i, word) in words.enumerated() {
             let rect = convertVisionToFlippedView(word.rect)
-            // Generous hit padding so tiny 8pt-10pt words are easy to click on any screen
+            // Generous hit padding so tiny 6pt-10pt words are easy to click on any screen
             let hitRect = rect.insetBy(dx: -6, dy: -4)
             if hitRect.contains(point) {
                 let dist = hypot(rect.midX - point.x, rect.midY - point.y)
@@ -1857,11 +2033,35 @@ class WordSelectionView: NSView {
     }
 }
 
-// MARK: - Single-Instance Menu Bar App Entry
+// MARK: - Single-Instance Menu Bar & CLI Entry
 
+let args = Array(CommandLine.arguments.dropFirst())
+if args.contains("--help") || args.contains("-h") {
+    print("""
+    ScreenLens — Offline AI Screen Translator & OCR Search
+    Usage:
+      screenlens              Launch menu bar tool
+      screenlens --translate  Translate active window main content (⌥⌘T)
+      screenlens --area       Select area to translate (⌥⌘A)
+      screenlens --search     Word select & Google search (⌥⌘S)
+      screenlens --clear      Dismiss active translation overlay
+    """)
+    exit(0)
+}
+
+let cliCommand = args.first(where: { ["--translate", "-t", "--area", "-a", "--search", "-s", "--clear", "-c"].contains($0) })
 let bundleID = Bundle.main.bundleIdentifier ?? "com.screenlens.app"
 let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+
 if runningApps.count > 1 {
+    if let cmd = cliCommand {
+        DistributedNotificationCenter.default().postNotificationName(
+            AppDelegate.cliCommandNotification,
+            object: nil,
+            userInfo: ["command": cmd],
+            deliverImmediately: true
+        )
+    }
     exit(0)
 }
 
@@ -1869,6 +2069,7 @@ if #available(macOS 14.0, *) {
     MainActor.assumeIsolated {
         let app = NSApplication.shared
         let delegate = AppDelegate()
+        delegate.initialCLICommand = cliCommand
         app.delegate = delegate
         app.run()
     }
