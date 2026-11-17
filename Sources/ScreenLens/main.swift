@@ -77,7 +77,7 @@ final class FloatingPanel: NSPanel {
 /// Shared IPC constants. Kept outside `AppDelegate` so the CLI path can use them on any
 /// macOS version and from a nonisolated context (`AppDelegate` is macOS 14+ and @MainActor).
 enum ScreenLensIPC {
-    static let cliCommandNotification = ScreenLensIPC.cliCommandNotification
+    static let cliCommandNotification = Notification.Name("com.screenlens.app.cliCommand")
 }
 
 // MARK: - App Delegate (Menu Bar & CLI Daemon)
@@ -85,7 +85,7 @@ enum ScreenLensIPC {
 @available(macOS 14.0, *)
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    static let cliCommandNotification = Notification.Name("com.screenlens.app.cliCommand")
+    static let cliCommandNotification = ScreenLensIPC.cliCommandNotification
 
     var statusItem: NSStatusItem!
     var translateHotKey: HotKey?
