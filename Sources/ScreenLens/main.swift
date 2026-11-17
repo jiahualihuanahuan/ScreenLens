@@ -72,6 +72,14 @@ final class FloatingPanel: NSPanel {
     }
 }
 
+// MARK: - CLI IPC
+
+/// Shared IPC constants. Kept outside `AppDelegate` so the CLI path can use them on any
+/// macOS version and from a nonisolated context (`AppDelegate` is macOS 14+ and @MainActor).
+enum ScreenLensIPC {
+    static let cliCommandNotification = ScreenLensIPC.cliCommandNotification
+}
+
 // MARK: - App Delegate (Menu Bar & CLI Daemon)
 
 @available(macOS 14.0, *)
@@ -1264,7 +1272,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureBestTextRequest(request, minimumTextHeight: minimumTextHeight)
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
         try handler.perform([request])
-        return (request.results as? [VNRecognizedTextObservation]) ?? []
+        return request.results ?? []
     }
 
     nonisolated func performMultiScaleOCR(on cgImage: CGImage, pointPixelScale: CGFloat) async throws -> [TextItem] {
@@ -2093,7 +2101,7 @@ let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier:
 if runningApps.count > 1 {
     if let cmd = cliCommand {
         DistributedNotificationCenter.default().postNotificationName(
-            AppDelegate.cliCommandNotification,
+            ScreenLensIPC.cliCommandNotification,
             object: nil,
             userInfo: ["command": cmd],
             deliverImmediately: true
